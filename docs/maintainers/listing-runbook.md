@@ -10,6 +10,10 @@ release, and they keep control of it (see [After the merge](#after-the-merge)).
 
 ## Rules for agents
 
+- **Read the release scan.** The pull request's "Scan the release" job
+  downloads the ZIP in an isolated job and reports whether the app can leave
+  the sandbox and how ([Release scan](../automation.md#release-scan)). Say in
+  the pull request what it found.
 - **Never download or run release files.** Everything comes from the GitHub
   API: the file's SHA-256 is GitHub's digest, and "native" is judged from the
   repository's `sce_sys/param.json`.
@@ -80,7 +84,7 @@ All of these must hold (see the [scope rule](../review-policy.md#maintainer-revi
 | Check | Evidence |
 | --- | --- |
 | Built for the PS5 and installed as its own title | `sce_sys/param.json` with a `PPSA…` `titleId` (the draft finds it) |
-| The release file is the app itself | `.zip` of the title folder, `.ffpkg` or `.ffpfsc`; install notes say to copy the title folder or image to `/data/homebrew/` |
+| The release file is the app itself | `.zip` of the title folder (the only format accepted at the moment; decline a listing or an update whose file is a `.ffpkg` or `.ffpfsc` image and ask for a `.zip`); install notes say to copy the title folder to `/data/homebrew/` |
 | Not a payload, PS4 package, backport, ROM or web page | no `.elf`/`.bin` payload as the main file, no `CUSA` title ID, README describes a native title |
 | It's the developer's own project | not a mirror or repackage of someone else's app; the README credits upstream work rather than claiming it |
 

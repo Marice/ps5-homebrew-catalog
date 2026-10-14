@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,6 +8,12 @@ from unittest import mock
 from catalog.report import Report
 from catalog import site
 from catalog.site import THEMES, build_site
+
+try:
+    import PIL  # noqa: F401
+    HAVE_PILLOW = True
+except ImportError:
+    HAVE_PILLOW = False
 
 from helpers import record, reservation, write_record
 
@@ -26,6 +33,15 @@ class SiteBuildTests(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    @staticmethod
+    def icon_png():
+        """A 64 x 64 plain red PNG."""
+        import io
+        from PIL import Image
+        output = io.BytesIO()
+        Image.new("RGB", (64, 64), (255, 0, 0)).save(output, "PNG")
+        return output.getvalue()
 
     def build(self, **options):
         report = Report()
@@ -51,7 +67,27 @@ class SiteBuildTests(unittest.TestCase):
         self.assertIn("/ps5/list/ /?view=list 301", redirects)
         self.assertIn("/ps5 / 301", redirects)
         self.assertIn("/ps5/* /:splat 301", redirects)
+        self.assertNotIn(" 302", redirects)
         self.assertFalse((root / "list").exists())
+
+    def test_withdrawn_apps_redirect_to_the_front_page(self):
+        from catalog import site
+        log = "apps/PPSA09999.json\n\napps/PPSA01234.json\napps/notes.txt\n"
+        with mock.patch.object(site, "_git", lambda *args: log):
+            # PPSA01234 was removed once and is listed again: it keeps its page.
+            self.assertEqual(site.withdrawn_titleids(self.apps, {"PPSA01234"}), ["PPSA09999"])
+        with mock.patch.object(site, "_git", lambda *args: None):
+            self.assertEqual(site.withdrawn_titleids(self.apps, set()), [])
+        with mock.patch.object(site, "withdrawn_titleids", lambda apps, listed: ["PPSA09999"]):
+            self.build()
+        redirects = (self.out / "_redirects").read_text(encoding="utf-8")
+        self.assertIn("/app/PPSA09999/ / 302", redirects)
+        self.assertIn("/app/PPSA09999 / 302", redirects)
+        # Its API file says so, and the signed manifest doesn't name it.
+        api = self.out / "api" / "v1"
+        self.assertEqual(json.loads((api / "apps" / "PPSA09999.json").read_text(encoding="utf-8")),
+                         {"schema": 3, "titleid": "PPSA09999", "status": "withdrawn"})
+        self.assertNotIn("apps/PPSA09999.json", json.loads((api / "manifest.json").read_text(encoding="utf-8"))["files"])
 
     def test_footer_shows_when_the_catalog_last_changed(self):
         with mock.patch.object(site, "source_commit_time", lambda commit: "2026-10-03T04:05:00Z"):
@@ -60,7 +96,12 @@ class SiteBuildTests(unittest.TestCase):
         self.assertIn('abc1234</a> · last updated <time datetime="2026-10-03T04:05:00Z">3 Oct 2026, 04:05 UTC</time>.',
                       page)
         self.assertIn('Maintained by <a href="https://github.com/blackbearreloaded">BlackBearReloaded</a> · Built from', page)
+        self.assertIn('<a class="notice"', page)
+        self.assertIn('href="https://github.com/blackbearreloaded/ProsperoStore"', page)
         tv = (self.out / "tv" / "index.html").read_text(encoding="utf-8")
+        self.assertIn('data-comments="https://raw.githubusercontent.com/blackbearreloaded/ps5-homebrew-catalog/comments-data/v1/"', tv)
+        # The QR library is one of the site's own files and comes before the script that uses it.
+        self.assertRegex(tv, r'<script src="/assets/qrcode\.[0-9a-f]+\.js" defer></script>\n<script src="/assets/tv\.')
         self.assertIn('<p class="tv-credit">Maintained by BlackBearReloaded · Built from abc1234 · last updated '
                       '<time datetime="2026-10-03T04:05:00Z">3 Oct 2026, 04:05 UTC</time></p>', tv)
         self.assertEqual(site._commit_time_html(None), "")
@@ -90,7 +131,8 @@ class SiteBuildTests(unittest.TestCase):
         self.assertEqual(app["release_url"], "https://github.com/example/example-app/releases/tag/01.000.000")
         # An offline build knows no release facts and has no icons; the fields are present and null.
         self.assertEqual([app[k] for k in ("size", "released", "prerelease", "content_version", "icon", "icon_small",
-                                           "icon_hash")], [None] * 7)
+                                           "icon_hash", "release_notes", "release_notes_truncated")], [None] * 9)
+        self.assertNotIn("notes-title", (self.out / "app" / "PPSA01234" / "index.html").read_text(encoding="utf-8"))
         soon = json.loads((api / "apps" / "PPSA05555.json").read_text(encoding="utf-8"))
         self.assertEqual((soon["status"], soon["artifact_url"], soon["format"], soon["tag"]),
                          ("coming_soon", None, None, None))
@@ -98,11 +140,29 @@ class SiteBuildTests(unittest.TestCase):
         self.assertEqual((index["schema"], index["count"], index["commit"]), (3, 3, "abc1234def"))
         self.assertEqual([a["titleid"] for a in index["apps"]], ["PPSA01234", "PPSA04321", "PPSA05555"])
         self.assertNotIn("description", index["apps"][0])
+        # When the catalog listed each app (null here: the test records have no git history).
+        self.assertIn("added", index["apps"][0])
+        self.assertIn("added", app)
+        # The news is published beside the catalog and stays out of the manifest (asserted below).
+        self.assertEqual(json.loads((api / "news.json").read_text(encoding="utf-8"))["schema"], 3)
+        self.assertIn("/api/*/news.sig\n  Content-Type: application/octet-stream",
+                      (self.out / "_headers").read_text(encoding="utf-8"))
         versions = json.loads((api / "versions.json").read_text(encoding="utf-8"))
         self.assertEqual(versions, {"schema": 3, "apps": {
             "PPSA01234": {"content_version": None, "version": "01.000.000"},
             "PPSA04321": {"content_version": None, "version": "2"}}})
         self.assertIn("/api/*\n  Access-Control-Allow-Origin: *", (self.out / "_headers").read_text(encoding="utf-8"))
+        # Likes and comments come from the comments branch: the page says where, and may fetch from there.
+        home = (self.out / "index.html").read_text(encoding="utf-8")
+        self.assertIn('data-comments="https://raw.githubusercontent.com/blackbearreloaded/ps5-homebrew-catalog/comments-data/v1/"', home)
+        self.assertNotIn("data-likes-for", home)   # likes are on the "Most liked" shelf, which the script makes
+        detail = (self.out / "app" / "PPSA01234" / "index.html").read_text(encoding="utf-8")
+        self.assertIn('data-comments-for="PPSA01234"', detail)
+        # The Like and Comment buttons come right after the release facts, before the description.
+        self.assertLess(detail.index('data-react="likes"'), detail.index('class="article"'))
+        self.assertIn('data-react="comments"', detail)
+        self.assertIn('href="https://github.com/blackbearreloaded/ps5-homebrew-catalog/discussions?discussions_q=PPSA01234"', detail)
+        self.assertIn("connect-src 'self' https://raw.githubusercontent.com;", (self.out / "_headers").read_text(encoding="utf-8"))
         self.assertIn("/api/*/manifest.sig\n  Content-Type: application/octet-stream",
                       (self.out / "_headers").read_text(encoding="utf-8"))
         # The manifest names every JSON file of the API by its hash; the build itself never signs.
@@ -115,10 +175,51 @@ class SiteBuildTests(unittest.TestCase):
         self.assertIsInstance(manifest["sequence"], int)
         self.assertFalse((api / "manifest.sig").exists())
 
+    def test_a_mirror_of_the_api_links_pages_to_the_website(self):
+        self.build(site_url="https://owner.github.io", base="/catalog/", pages_url="https://homebrew.page/")
+        app = json.loads((self.out / "catalog" / "api" / "v1" / "apps" / "PPSA01234.json").read_text(encoding="utf-8"))
+        self.assertEqual(app["page"], "https://homebrew.page/app/PPSA01234/")
+        index = json.loads((self.out / "catalog" / "api" / "v1" / "index.json").read_text(encoding="utf-8"))
+        self.assertEqual(index["count"], 3)
+
+    def test_safety_labels_come_from_scan_summaries(self):
+        from catalog import facts as facts_module
+        from catalog import scan as scan_module
+        sha = "a" * 64
+        summary = {"scanner": scan_module.SCANNER, "sha256": sha, "titleid": "PPSA01234", "sandbox": "leaves",
+                   "routes": ["payload"], "payloads": [{"path": "PPSA01234/helper.elf", "sha256": "b" * 64}],
+                   "network": True, "attested": False, "workflow": None}
+        scans = self.out.parent / "scans"
+        scans.mkdir()
+        (scans / f"{sha}.json").write_text(json.dumps(summary), encoding="utf-8")
+        (scans / f"{'c' * 64}.json").write_text("not json", encoding="utf-8")
+        known = facts_module.Facts(uploader="actions")
+        with mock.patch.object(facts_module, "cached", lambda record, github, cache, fetch=None: (known, None)):
+            self.build(scans=scans)
+        api = self.out / "api" / "v1"
+        app = json.loads((api / "apps" / "PPSA01234.json").read_text(encoding="utf-8"))
+        self.assertEqual(app["safety"], {"sandbox": "leaves", "routes": ["payload"], "helpers": 1,
+                                         "helpers_unapproved": 1, "network": True, "build": "workflow",
+                                         "build_workflow": None})
+        index = json.loads((api / "index.json").read_text(encoding="utf-8"))
+        self.assertEqual([a["sandbox"] for a in index["apps"]], ["leaves", None, None])
+        page = (self.out / "app" / "PPSA01234" / "index.html").read_text(encoding="utf-8")
+        self.assertIn('<h2 id="safety-title">Safety</h2>', page)
+        self.assertIn("Leaves the sandbox", page)
+        self.assertIn("1 helper(s) not reviewed", page)
+        self.assertIn("Released by a workflow", page)
+        # Without summaries nothing is claimed.
+        self.build()
+        app = json.loads((self.out / "api" / "v1" / "apps" / "PPSA01234.json").read_text(encoding="utf-8"))
+        self.assertIsNone(app["safety"])
+        self.assertNotIn("safety-title", (self.out / "app" / "PPSA01234" / "index.html").read_text(encoding="utf-8"))
+
     def test_api_release_facts_and_icons(self):
         from catalog import facts as facts_module
         known = facts_module.Facts(size=4096, released="2026-09-01T10:00:00Z", prerelease=False,
-                                   content_version="01.000.000", param_path="sce_sys/param.json")
+                                   content_version="01.000.000", param_path="sce_sys/param.json",
+                                   notes="## Fixed\n- <b>Menus</b> open [faster](https://example.com) "
+                                         "<script>alert(1)</script>\n\n**Full Changelog**: https://x/y")
         png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR" + (512).to_bytes(4, "big") * 2
         with mock.patch.object(site, "_icon", lambda url, cache: (png, "png", png)), \
                 mock.patch.object(site, "png_icons", lambda data: {512: b"large", 256: b"small"}), \
@@ -129,8 +230,18 @@ class SiteBuildTests(unittest.TestCase):
         app = json.loads((api / "apps" / "PPSA01234.json").read_text(encoding="utf-8"))
         self.assertEqual((app["size"], app["released"], app["prerelease"], app["content_version"]),
                          (4096, "2026-09-01T10:00:00Z", False, "01.000.000"))
-        self.assertEqual(app["icon"], "https://homebrew.page/api/v1/icons/PPSA01234.png")
-        self.assertEqual(app["icon_small"], "https://homebrew.page/api/v1/icons/PPSA01234-256.png")
+        self.assertEqual((app["release_notes"], app["release_notes_truncated"]),
+                         ("Fixed\n- Menus open faster alert(1)", False))
+        page = (self.out / "app" / "PPSA01234" / "index.html").read_text(encoding="utf-8")
+        self.assertIn('<h2 id="notes-title">Release notes</h2>', page)
+        self.assertIn("<li>Menus open faster alert(1)</li>", page)
+        self.assertNotIn("<script>alert", page)
+        self.assertIn('rel="nofollow">See this release on GitHub</a>', page)
+        # An icon's address changes with the picture, so no cache can answer it with an older one.
+        import hashlib
+        fingerprint = hashlib.sha256(png).hexdigest()[:16]
+        self.assertEqual(app["icon"], f"https://homebrew.page/api/v1/icons/PPSA01234.png?v={fingerprint}")
+        self.assertEqual(app["icon_small"], f"https://homebrew.page/api/v1/icons/PPSA01234-256.png?v={fingerprint}")
         self.assertEqual((api / "icons" / "PPSA01234-256.png").read_bytes(), b"small")
         # The fingerprint is of the developer's image, so it changes only when that image does.
         import hashlib
@@ -179,11 +290,52 @@ class SiteBuildTests(unittest.TestCase):
         self.assertNotIn("rel=\"nofollow\"", page)
         self.assertNotIn("None", page)
         html = (root / "index.html").read_text(encoding="utf-8")
-        self.assertEqual(html.count('data-status="soon"'), 2)
+        self.assertEqual(html.count('data-status="soon"'), 1)
+        self.assertIn('class="tile tile--soon', html)
         self.assertIn('data-status="available"', html)
 
-    def test_catalog_page_holds_both_views_and_filters(self):
+    def test_catalog_page_is_the_store_front(self):
         self.build()
+        html = (self.out / "index.html").read_text(encoding="utf-8")
+        self.assertEqual(html.count('class="tile-item"'), 3)
+        for hook in ("data-tabs", "data-stage", "data-shelves", "data-tiles", "data-search", "data-sort",
+                     'data-section="soon"', 'data-base="/"'):
+            self.assertIn(hook, html)
+        # The content security policy allows no inline styles: colours come from the stylesheet.
+        for page in self.out.rglob("*.html"):
+            self.assertNotIn(" style=", page.read_text(encoding="utf-8"), page)
+
+    def test_sizes_are_worded_as_people_say_them(self):
+        self.assertEqual((site.size_label(38_797_312), site.size_label(1_500_000), site.size_label(None)),
+                         ("37 MB", "1.4 MB", ""))
+
+    def test_a_build_without_pillow_uses_the_themes_own_picture(self):
+        with mock.patch.object(site, "make_ambient", lambda icon: None):
+            self.build()
+        html = (self.out / "index.html").read_text(encoding="utf-8")
+        self.assertEqual(len(list((self.out / "assets").glob("ambient.*.png"))), 1)
+        self.assertIn('data-accent="#42358f"', html)
+
+    @unittest.skipUnless(HAVE_PILLOW, "needs Pillow")
+    def test_each_app_gets_its_picture_and_colour(self):
+        png = self.icon_png()
+        with mock.patch.object(site, "_icon", lambda url, cache: (png, "png", png)):
+            self.build(fetch_icons=True)
+        html = (self.out / "index.html").read_text(encoding="utf-8")
+        pictures = sorted(path.name for path in (self.out / "assets").glob("ambient-*.png"))
+        self.assertEqual([name.split(".")[0] for name in pictures],
+                         ["ambient-PPSA01234", "ambient-PPSA04321", "ambient-PPSA05555"])
+        self.assertIn(f'src="/assets/{pictures[0]}"', html)
+        css = next((self.out / "assets").glob("farlight.*.css")).read_text(encoding="utf-8")
+        # The test icon is plain red; the reservation takes its colour from the shared picture.
+        self.assertIn(".tone-PPSA01234{--tone:#ff0000}", css)
+        self.assertRegex(css, r"\.tone-PPSA05555\{--tone:#[0-9a-f]{6}\}")
+        self.assertIn('data-accent="#ff0000"', html)
+        # A grey icon, or none, gets the theme's own violet.
+        self.assertEqual(site.make_ambient(None)[1], "#42358f")
+
+    def test_holo_catalog_page_holds_both_views_and_filters(self):
+        self.build(theme="holo")
         html = (self.out / "index.html").read_text(encoding="utf-8")
         self.assertEqual(html.count('class="lrow '), 3)
         self.assertEqual(html.count('class="card-item"'), 3)
@@ -251,6 +403,21 @@ class IconCacheTests(unittest.TestCase):
                 site.build_site(root / "out3", apps, Report(), icon_cache=cache)
                 self.assertEqual(len(fetches), 2)
                 self.assertEqual(len(list(cache.glob("*.img"))), 1)
+                # A copy older than a day is fetched again; when that fails, the copy is still used.
+                entry, = cache.glob("*.img")
+                old = entry.stat().st_mtime - site.ICON_MAX_AGE - 60
+                os.utime(entry, (old, old))
+                site.build_site(root / "out4", apps, Report(), icon_cache=cache)
+                self.assertEqual(len(fetches), 3)
+                os.utime(entry, (old, old))
+
+                def failing_fetch(url, limit):
+                    raise site.artifacts.DownloadError("offline")
+
+                report = Report()
+                with mock.patch.object(site.artifacts, "fetch_small", failing_fetch):
+                    site.build_site(root / "out5", apps, report, icon_cache=cache)
+                self.assertTrue(list((root / "out5").rglob("*.png")))
 
 
 if __name__ == "__main__":

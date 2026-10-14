@@ -2,7 +2,7 @@
 
 The store at <https://homebrew.page/> is a static site generated from
 `apps/` by `python3 -m catalog build` and deployed to Cloudflare Pages by GitHub
-Actions on every push to `main`. There is no server-side code, database or tracking.
+Actions when a maintainer starts the CI workflow on `main` by hand. There is no server-side code, database or tracking.
 
 ## What the build produces
 
@@ -10,47 +10,82 @@ Actions on every push to `main`. There is no server-side code, database or track
 dist/
 ├── _headers, _redirects        Cloudflare Pages security headers, caching, redirects
 ├── 404.html, robots.txt
-├── index.html                  the catalog: cards, or a compact list (?view=list)
+├── index.html                  the catalog: Discover, and a section each for apps, games, tools and coming soon
 ├── tv/                         TV mode: the catalog as a 10-foot interface
 ├── app/<TITLEID>/              one page per app: download, install steps, sha256
 ├── api/v1/                     the store API: per-app files, index, versions, PNG icons, signed manifest
 ├── catalog/v1.json             the older single-file feed
-└── assets/                     content-hashed CSS, JS and WebP icons
+└── assets/                     content-hashed CSS, JS, WebP icons and each app's ambient picture
 ```
 
-- **One catalog page, two views.** `/` holds both the cards and the list;
-  the Cards/List switch changes view in place. Search, type chips, status
-  (available or coming soon), format and sort apply to both and live in the URL
-  (`?q=…&kind=game&sort=updated&dir=asc&view=list`), so any filtered view can be
-  linked. The old `/list/` redirects there. The site used to live under
-  `/ps5/`; every `/ps5/…` URL redirects to the same page at the root.
-- **Sorting.** By name, updated date, developer, type or title ID, ascending or
-  descending (the ↑/↓ button). In the list view, clicking a column header sorts
-  by it, and clicking it again reverses the order. Updated dates default to newest
-  first; everything else defaults to A to Z.
-- **In-page navigation.** Opening an app fetches its static page and swaps its
-  content in without reloading; Back returns to the catalog with the same
-  filters, view, scroll position and focus. Every app page is still a complete
-  HTML page, so direct links, link previews, search engines and browsers
-  without JavaScript all work.
-- **Mobile-first layout.** On phones the cards form two columns, the list
-  collapses to icon, name, a one-line summary and a download button, and the
-  type chips scroll sideways.
+- **One catalog page, as a store front.** `/` opens on **Discover**: a stage
+  that shows one app big (the five newest in turn, eight seconds each, or the
+  tile under the pointer) over shelves: New and updated, Apps, Games, Tools,
+  Coming soon. The tabs in the top bar switch to a section, which is a grid of
+  the same tiles. The section, the search and the order live in the URL
+  (`?section=games&q=…&sort=updated`), so any view can be linked. The old
+  `/list/` and `?view=list` addresses open the catalog. The site used to live
+  under `/ps5/`; every `/ps5/…` URL redirects to the same page at the root.
+- **Search and order.** The search box (or `/`) finds apps by name, developer,
+  title ID or description, across every section. A section is ordered by name
+  or by most recently updated.
+- **An app's page** is a complete static page: the app over its own colours,
+  its facts as chips (version, size, licence, format), a panel with the
+  download, the install steps and the SHA-256. Direct links, link previews and
+  search engines see everything.
+- **Each app's colours come from its icon.** The build takes the icon's two
+  main hues and paints a small soft picture from them (96 x 54 pixels), used
+  behind the app on the stage, on its tile and on its page, and puts the main
+  hue in the stylesheet as that app's accent. This is the picture ProsperoStore
+  makes on the console, by the same rules. A grey icon gets the theme's violet.
+  It needs Pillow; without it every app gets the theme's own picture.
+- **Phones.** The top bar wraps and its tabs scroll sideways, shelves scroll
+  with a finger, grids go to two columns and then one, and an app's download
+  panel moves up under its name.
 - **Updated dates.** Each app shows when its record last changed on `main`,
   taken from the git history of `apps/<TITLEID>.json`. The build deepens a
   shallow clone first so dates stay correct in CI.
+- **Release notes.** An app's page shows what its developer wrote on the listed
+  GitHub release, read from GitHub at build time (again at most once a day,
+  since developers edit them). The text is the developer's and nobody reviews
+  it, so only headings, paragraphs and lists are kept: images, links' targets
+  and raw HTML are dropped (`catalog/notes.py`). Long notes are cut, with a
+  link to the release; a release without notes has no such section.
 - **Coming soon.** Title ID reservations appear as cards with the shared
   "Coming soon" picture (`site/shared/coming-soon.png`) in place of an icon,
   and no download; see [Reserving a title ID](submitting.md#reserving-a-title-id).
 - Every metadata value is HTML-escaped; descriptions render as plain text.
 - Icons are fetched from `icon_url`, resized to 512 px WebP (when Pillow is
   installed) and served from the site, so visitors never hit the original host.
-  The deploy job keeps them in a CI cache, so each icon URL is fetched only once
-  across deploys. A broken icon becomes a placeholder with a build warning.
-- Filtering waits for a pause in typing and only updates the view on screen;
-  at 1,000 apps a filter change takes a few milliseconds.
-- Pages work without JavaScript; the script adds search, filters, sorting,
-  copy buttons and card effects.
+  The deploy job keeps them in a CI cache and fetches an icon again only when its
+  copy is older than a day, so a changed picture at the same address shows up
+  with the next deploy after that. A broken icon becomes a placeholder with a build warning.
+- Search waits for a pause in typing. A shelf shows at most 20 tiles; its
+  section shows them all.
+- Without JavaScript the catalog page is the plain grid of every app, and every
+  app page is complete; the script adds Discover, the sections, search, the
+  order and the copy buttons. The pages carry no inline styles or scripts, as
+  the content security policy requires.
+- **Comments and likes** are the app's GitHub Discussion
+  ([how they get there](automation.md#comments-and-likes)). The page's script
+  reads them from the `comments-data` branch through raw.githubusercontent.com,
+  the one address besides the site itself the content security policy lets it
+  fetch from: an app's page has Like and Comment buttons with their counts and
+  the latest comments, every tile shows the app's likes and comments (zero
+  included), Discover gets a ranked "Most liked" shelf once an app
+  has a like, and the sections can be ordered by "Most liked". TV mode shows
+  the counts on every tile and in an app's details with its latest comments,
+  can order by "Most liked", and shows two QR codes there: one for the app's
+  page, to download it, and one for its discussion, to like or comment. They
+  are drawn in the page by a bundled library
+  ([qrcode-generator](https://github.com/kazuhikoarase/qrcode-generator), MIT);
+  no address is sent anywhere to make them. Everything is
+  shown as plain text. Writing happens on GitHub, through the link on the page.
+  When the files can't be read the page keeps only that link.
+- The page of an app withdrawn in the last 30 days redirects to the front page,
+  and its API file is replaced by one that says `"status": "withdrawn"`.
+  Cloudflare Pages keeps serving a file for a while after a deployment drops
+  it; the redirect at that address takes over at once.
 - The build fails, and Cloudflare keeps the previous deployment, if any record
   is invalid.
 
@@ -129,11 +164,20 @@ listed separately in `coming_soon`. Both are sorted by title ID. `updated` is
 
 ## Design
 
-The site uses the Holo theme: a collector's binder where every app is a
-holographic trading card with foil, tilt and a numbered strip. Its templates and
-stylesheet are in `site/themes/holo/`; `site/shared/` holds the script and
-images. The generator can host further themes in `site/themes/` and select them
-with `--theme`.
+The site uses the **Farlight** theme: ProsperoStore's own look, so the catalog
+looks the same on the web and on the console. From the store it takes the
+colours (a warm white for all words, a deep indigo, a violet mid tone and one
+gold for calls to action), the faces (Inter, and Montserrat for headlines), the
+measurements (the stylesheet's unit is one pixel of the store's 1920 x 1080
+canvas), the stage, shelves and tiles of its Discover screen, and the glass
+panel of its app page. Its templates, stylesheet and script are in
+`site/themes/farlight/`.
+
+The earlier **Holo** theme (every app a holographic trading card, with a list
+view and format filters) is still in `site/themes/holo/` and builds with
+`--theme holo`; `site/shared/` holds its script and the images both themes
+use. A theme may bring its own `app.js` and `favicon.svg`; otherwise the
+shared ones are used.
 
 ## Build and preview locally
 
@@ -174,6 +218,45 @@ access to this repository.
   and the project's `*.pages.dev` name. Keep WHOIS privacy on for the domain;
   Cloudflare Registrar redacts owner details by default.
 
+### API mirror
+
+After the site is uploaded, the same job builds the store API once more for
+this repository's GitHub Pages address, signs it, and a second job publishes
+it there. It exists for consoles whose network blocks the main site
+([Store API: mirror](api.md#mirror)). Only the API is published; the mirror's
+front page is one static file, `site/mirror/index.html`. GitHub Pages must be
+enabled for the repository with "GitHub Actions" as its source.
+
+### Fallback deploy
+
+When GitHub's hosted runners are down, merges reach `main` but the site stays
+on the previous build. [Deploy fallback](../.github/workflows/deploy-fallback.yml)
+runs the same deploy on a machine the maintainer controls.
+
+- **It never runs by itself.** Its only trigger is a manual start, the job
+  requires the repository owner and `main`, and it targets a runner labelled
+  `catalog-fallback`. No pull request, push or schedule can reach that runner.
+- **No runner is kept registered.** The maintainer registers one for a single
+  job (`config.sh --ephemeral --labels catalog-fallback`), starts it, runs the
+  workflow, and the runner unregisters itself when the job ends. Never install
+  it as a service: a standing self-hosted runner on a public repository is the
+  risk, not this file.
+- **The secrets stay in GitHub** and reach the job through the
+  `cloudflare-pages` environment, as in the normal deploy.
+- **The machine needs** Python 3 with Pillow and `cryptography`, `git` and
+  `curl`; Node is fetched by the workflow.
+
+```sh
+cd ~/actions-runner
+./config.sh --unattended --ephemeral --replace --name fallback --labels catalog-fallback \
+    --url https://github.com/<owner>/ps5-homebrew-catalog \
+    --token "$(gh api -X POST repos/<owner>/ps5-homebrew-catalog/actions/runners/registration-token -q .token)"
+./run.sh &                                   # "Listening for Jobs"
+gh workflow run deploy-fallback.yml --repo <owner>/ps5-homebrew-catalog
+```
+
+The workflow repeats the deploy job of `ci.yml`; change both together.
+
 ### One-time setup
 
 1. **No project to create by hand.** The deploy job creates the Pages project
@@ -194,7 +277,7 @@ access to this repository.
 5. **Switch deployment on.** Under **Settings → Secrets and variables → Actions
    → Variables**, add the repository variable `CLOUDFLARE_PAGES_PROJECT` =
    `homebrew-page`. The deploy job is skipped while this variable is missing.
-6. **Deploy.** Go to **Actions → CI → Run workflow** on `main`, or push. Check
+6. **Deploy.** Go to **Actions → CI → Run workflow** on `main`. Check
    `https://homebrew-page.pages.dev/`. If the name is taken on `pages.dev`,
    Cloudflare adds a suffix; the project's page in the dashboard shows the address.
 7. **Connect the domain.** In the Pages project, go to **Custom domains → Set up

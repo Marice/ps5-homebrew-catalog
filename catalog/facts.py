@@ -12,13 +12,20 @@ its contentVersion isn't in the PlayStation format; clients then can't tell
 whether an installed copy is current.
 
 Facts belong to one exact file, so they are cached by the record's sha256 and
-looked up again only when an app moves to a new release.
+looked up again when an app moves to a new release, or when its icon moves:
+the content version is read from the param.json beside the icon, so a record
+whose icon now points at a commit that holds one must be asked again.
+
+The release notes (catalog/notes.py) are the exception: a developer can edit
+them at any time. So an answer is trusted for a day, then asked again; when
+GitHub can't answer, the older one keeps being used.
 """
 
 from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -29,6 +36,8 @@ from .records import Record
 CONTENT_VERSION = re.compile(r"[0-9]{2}\.[0-9]{3}\.[0-9]{3}")
 MAX_PARAM_BYTES = 65536
 MAX_PARAM_FILES = 5     # param.json files tried when the repository has several (vendored samples)
+MAX_NOTES = 40000       # characters of release notes kept
+FRESH_SECONDS = 86400   # how long a cached answer is used before GitHub is asked again
 
 
 @dataclass(frozen=True)
@@ -38,6 +47,8 @@ class Facts:
     prerelease: bool | None = None
     content_version: str | None = None     # param.json contentVersion at the tag
     param_path: str | None = None          # where it was read from ("version" when taken from the record)
+    notes: str | None = None               # the release's notes as the developer wrote them (GitHub Markdown)
+    uploader: str | None = None            # who attached the file: "actions" (a workflow) or "developer"
 
 
 def content_version_key(value: str | None) -> tuple[int, int, int] | None:
@@ -92,8 +103,12 @@ def lookup(record: Record, github: GitHub, fetch=None) -> Facts:
     release = github.release_by_tag(record.owner, record.repo, record.tag) or {}
     asset = next((a for a in release.get("assets", []) if a.get("name") == record.asset_name), {})
     content_version, where = find_content_version(record, github, fetch)
+    body = release.get("body")
+    login = (asset.get("uploader") or {}).get("login")
+    uploader = None if not login else "actions" if login == "github-actions[bot]" else "developer"
     return Facts(size=asset.get("size"), released=release.get("published_at"),
-                 prerelease=release.get("prerelease"), content_version=content_version, param_path=where)
+                 prerelease=release.get("prerelease"), content_version=content_version, param_path=where,
+                 notes=body[:MAX_NOTES] if isinstance(body, str) and body.strip() else None, uploader=uploader)
 
 
 def cached(record: Record, github: GitHub | None, cache: Path | None, fetch=None) -> tuple[Facts, str | None]:
@@ -101,20 +116,29 @@ def cached(record: Record, github: GitHub | None, cache: Path | None, fetch=None
     if record.reserved:
         return Facts(), None
     entry = cache / "facts" / f"{record.data['sha256']}.json" if cache else None
+    older = None        # a cached answer that is due to be asked again
     if entry and entry.is_file():
         try:
-            return Facts(**json.loads(entry.read_text(encoding="utf-8"))), None
-        except (OSError, ValueError, TypeError):
-            entry.unlink(missing_ok=True)
+            saved = json.loads(entry.read_text(encoding="utf-8"))
+            # An entry without "notes" or "uploader" was written before they were read.
+            if saved.pop("icon_url", None) == record.data["icon_url"] and "notes" in saved and "uploader" in saved:
+                older = Facts(**saved)
+                if github is None or time.time() - entry.stat().st_mtime < FRESH_SECONDS:
+                    return older, None
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+        if older is None:
+            entry.unlink(missing_ok=True)      # unreadable, or answered for another icon
     if github is None:
         return Facts(), None
     try:
         facts = lookup(record, github, fetch)
     except GitHubError as error:
-        return Facts(), str(error)      # not cached: the next build asks again
+        # A new answer isn't cached, so the next build asks again; an older one keeps serving.
+        return (older, None) if older else (Facts(), str(error))
     if entry:
         entry.parent.mkdir(parents=True, exist_ok=True)
-        entry.write_text(json.dumps(asdict(facts)), encoding="utf-8")
+        entry.write_text(json.dumps(asdict(facts) | {"icon_url": record.data["icon_url"]}), encoding="utf-8")
     return facts, None
 
 

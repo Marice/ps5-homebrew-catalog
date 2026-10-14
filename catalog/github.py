@@ -51,6 +51,14 @@ class GitHub:
     def _get(self, path: str):
         return self._request("GET", path)
 
+    def graphql(self, query: str, variables: dict | None = None) -> dict:
+        """The `data` of a GraphQL answer; an answer with errors raises GitHubError."""
+        answer = self._request("POST", "/graphql", {"query": query, "variables": variables or {}})
+        if not answer or answer.get("errors") or "data" not in answer:
+            errors = "; ".join(e.get("message", "") for e in (answer or {}).get("errors", [])) or "no data"
+            raise GitHubError(f"GitHub GraphQL request failed: {errors}")
+        return answer["data"]
+
     def repo(self, owner: str, name: str) -> dict | None:
         return self._get(f"/repos/{quote(owner)}/{quote(name)}")
 
@@ -133,13 +141,6 @@ class GitHub:
                           f"&head={quote(owner)}:{quote(head_branch)}") or []
         return [p.get("title", "") for p in pulls if not p.get("merged_at")]
 
-    def closed_pull_bodies(self, repository: str, head_branch: str) -> list[str]:
-        """Bodies of the branch's recent pull requests that were closed without merging."""
-        owner = repository.split("/")[0]
-        pulls = self._get(f"/repos/{repository}/pulls?state=closed&per_page=30"
-                          f"&head={quote(owner)}:{quote(head_branch)}") or []
-        return [p.get("body") or "" for p in pulls if not p.get("merged_at")]
-
     def close_pull(self, repository: str, number: int) -> dict:
         return self._request("PATCH", f"/repos/{repository}/pulls/{number}", {"state": "closed"})
 
@@ -149,3 +150,17 @@ class GitHub:
 
     def update_pull(self, repository: str, number: int, title: str, body: str) -> dict:
         return self._request("PATCH", f"/repos/{repository}/pulls/{number}", {"title": title, "body": body})
+
+    # Used only by the automatic merge of a developer's release bump, with the catalog bot's token.
+    # Both name the commit that was checked: GitHub refuses them when the pull request has moved on.
+
+    def approve_pull(self, repository: str, number: int, sha: str, body: str) -> dict:
+        return self._request("POST", f"/repos/{repository}/pulls/{number}/reviews",
+                             {"commit_id": sha, "event": "APPROVE", "body": body})
+
+    def merge_pull(self, repository: str, number: int, sha: str, title: str) -> dict:
+        merged = self._request("PUT", f"/repos/{repository}/pulls/{number}/merge",
+                               {"sha": sha, "merge_method": "squash", "commit_title": title})
+        if merged is None:
+            raise GitHubError(f"pull request #{number} was not found")
+        return merged

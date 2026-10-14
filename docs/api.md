@@ -18,6 +18,7 @@ API itself, and there is no server behind it, only files on a CDN.
 | [`/api/v1/index.json`](https://homebrew.page/api/v1/index.json) | One compact entry per app, reservations included | about 330 bytes per app | show the catalog as a list |
 | `/api/v1/apps/<TITLEID>.json` | Everything about one app | about 1 KB | show one app, install it, or let an app check itself |
 | [`/api/v1/manifest.json`](https://homebrew.page/api/v1/manifest.json) and `manifest.sig` | The hash of every JSON file above, the catalog's sequence number, and a signature over both | about 90 bytes per app | verify that the catalog is genuine before installing from it |
+| [`/api/v1/news.json`](https://homebrew.page/api/v1/news.json) and `news.sig` | Short messages from the catalog's maintainers, newest first, and a signature over the file | under 64 KB | show what is new; see [News](#news-newsjson) |
 | `/api/v1/icons/<TITLEID>.png` | The app's icon as PNG, at most 512 px on its longer side | varies | show the icon without a WebP decoder |
 | `/api/v1/icons/<TITLEID>-256.png` | The same, at most 256 px | varies | lists and grids |
 
@@ -53,10 +54,13 @@ still published and unchanged; new clients should use the API.
   "released": "2026-09-22T18:23:50Z",
   "prerelease": false,
   "release_url": "https://github.com/sainsaji/EVO-PLAYER-PS5/releases/tag/v0.10.0",
+  "release_notes": "EVO is a real PS5 app now. It runs as a game-category app module, …\n\nA Real Application\n- Game-category app module (PPSA99039). …",
+  "release_notes_truncated": true,
+  "safety": {"sandbox": "leaves", "routes": ["service"], "helpers": 0, "helpers_unapproved": 0, "network": true, "build": "developer", "build_workflow": null},
   "updated": "2026-09-29T17:20:37Z",
   "page": "https://homebrew.page/app/PPSA99039/",
-  "icon": "https://homebrew.page/api/v1/icons/PPSA99039.png",
-  "icon_small": "https://homebrew.page/api/v1/icons/PPSA99039-256.png",
+  "icon": "https://homebrew.page/api/v1/icons/PPSA99039.png?v=5b0c1e7a9d3f4a26",
+  "icon_small": "https://homebrew.page/api/v1/icons/PPSA99039-256.png?v=5b0c1e7a9d3f4a26",
   "icon_hash": "5b0c1e7a9d3f4a26"
 }
 ```
@@ -67,15 +71,18 @@ The first eleven fields after `schema` are the app's record, exactly as in
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `schema` | integer | Schema revision of this file; see [Versioning of the API](#versioning-of-the-api). |
-| `status` | string | `available`: the app has a release and can be installed. `coming_soon`: the title ID is [reserved](submitting.md#reserving-a-title-id) and nothing can be downloaded yet. |
+| `status` | string | `available`: the app has a release and can be installed. `coming_soon`: the title ID is [reserved](submitting.md#reserving-a-title-id) and nothing can be downloaded yet. `withdrawn`: the app was removed from the catalog in the last 30 days; the file then has only `schema`, `titleid` and `status`, and it is not in the index or the manifest. |
 | `content_version` | string or null | The release's `contentVersion` from its `sce_sys/param.json`, in the PlayStation format `NN.NNN.NNN` (`01.000.070`). **This is the value to compare with an installed copy**; see [Finding updates](#finding-updates). `null` when it isn't known. |
-| `format` | string or null | `zip`, `ffpkg` or `ffpfsc`; see [Artifact formats](artifact-formats.md) for how each is installed. |
+| `format` | string or null | `zip` for every app accepted now: the app folder in an archive. A listing made before ZIP became the only accepted format can still be `ffpkg` or `ffpfsc` (an image file); a client that installs only `zip` should show such an app as not installable. See [Artifact formats](artifact-formats.md). |
 | `artifact_name` | string or null | File name of the download. |
 | `size` | integer or null | Size of the download in bytes. |
 | `tag` | string or null | The GitHub release tag. `version` is this tag, or this tag without a leading `v`. |
 | `released` | string or null | When the developer published the release. |
 | `prerelease` | boolean or null | Whether the developer marked the release as a pre-release. The catalog lists an app's newest release, pre-releases included. |
 | `release_url` | string or null | The release's page on GitHub, with the developer's notes. |
+| `release_notes` | string or null | What the developer wrote on the listed release, as plain text: at most 4,000 characters, lines separated by `\n`, list items starting with `- `, and a blank line before each heading or new paragraph. `null` when the release has no notes (empty, or only GitHub's generated changelog link) and for `coming_soon` apps. See [Release notes](#release-notes). |
+| `safety` | object or null | What an automatic scan of the release file found; `null` when the release wasn't scanned. See [Safety](#safety). |
+| `release_notes_truncated` | boolean or null | `true` when the notes were longer than the limit and were cut at the end of a block; the rest is at `release_url`. `null` when `release_notes` is. |
 | `updated` | string or null | When the app's record last changed in the catalog. |
 | `page` | string | The app's page on the website. |
 | `icon` | string or null | PNG icon, at most 512 px on its longer side. |
@@ -103,10 +110,58 @@ Rules that hold for every file:
    **Install nothing that doesn't match.** The developer replacing a release
    file changes its hash; the catalog's daily health check then flags the
    listing.
-3. Install according to `format` ([Artifact formats](artifact-formats.md)).
+3. Install according to `format` ([Artifact formats](artifact-formats.md)):
+   for `zip`, extract the app folder. Don't install a format you don't handle.
 
 `size` lets a client show progress and check free space first; when it is
 `null`, use the download's `Content-Length`.
+
+### Release notes
+
+`release_notes` answers "what is in this version?" for a store's app page or
+update screen. It is only in this file, not in the index or the version map.
+
+- **It is the developer's text, not the catalog's.** Nobody reviews it, and the
+  developer can change it at any time; the catalog reads it again when the
+  site is rebuilt, at most once a day. Show it as the developer's words. It is covered by the catalog's
+  signature like the rest of the file, which proves only that the catalog
+  published it.
+- **It is plain text.** The build reads the release's GitHub Markdown and keeps
+  headings, paragraphs and list items; images are dropped, links keep their
+  text, tables become one line per row, and raw HTML keeps only what it
+  encloses. A client needs no Markdown or HTML parser: split on `\n`, and
+  treat a line that starts with `- ` as a list item if it wants bullets.
+- **It can be any language** the developer wrote in, with any Unicode
+  characters, emoji included; draw what the font has and skip the rest.
+- **It is often more than a list of changes.** Many releases also carry install
+  steps or requirements, and a first release usually describes the app.
+
+### Safety
+
+`safety` tells a store what it can say about an app before the user installs
+it. It comes from a scan that reads the release file and never runs it
+([Release scan](automation.md#release-scan)).
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `sandbox` | string | `stays`: no way out of the PS5's sandbox was found. `leaves`: the app can get full access to the console. `unclear`: weak signs only. |
+| `routes` | array of strings | How it leaves: `loader` (connects to the payload loader), `service` (asks a resident jailbreak service), `payload` (ships a helper that runs outside the sandbox). Empty for `stays`. |
+| `helpers` | integer | Helper programs in the release that run outside the sandbox. |
+| `helpers_unapproved` | integer | How many of them the catalog's maintainers have not reviewed. |
+| `network` | boolean | Whether any executable imports network functions. |
+| `build` | string or null | `attested`: GitHub holds a verified statement that a workflow of the app's repository built this exact file. `workflow`: a workflow attached the file to the release. `developer`: uploaded by hand. `null`: unknown. |
+| `build_workflow` | string or null | For `attested`, the workflow that built it. |
+
+How to use it:
+
+- **It is advice, not a guarantee.** The scan sees what honest code does; code
+  can hide from it. Say "no way out of the sandbox was found", not "safe".
+- **`leaves` is common and often fine.** Many apps elevate to read and write
+  `/data`. It is the fact a user should know before trusting a developer.
+- **Treat a missing object as unknown,** not as `stays`.
+
+`index.json` carries `sandbox` alone (the same three values, or `null`), for a
+badge in lists.
 
 ## The list: `index.json`
 
@@ -142,6 +197,39 @@ fetch `apps/<TITLEID>.json` for the description, license, download and hash.
 `icon_hash` is there so a list can keep its icons; see [Caching icons](#caching-icons).
 `generated` and `commit` say which build of the catalog this is; `count` is the
 length of `apps`.
+
+`added` is when the catalog first listed the app (the first commit of its
+record), `null` when the build can't read the history. A list can use it for
+"new in the catalog"; `released` and `updated` move with every release.
+
+## News: `news.json`
+
+```json
+{
+  "schema": 3,
+  "news": [
+    {
+      "id": "2026-10-11-developer-pages",
+      "date": "2026-10-11T09:00:00Z",
+      "title": "Developer pages",
+      "body": "Open an app and see everything else its developer made.\n\nA blank line starts a new paragraph."
+    }
+  ]
+}
+```
+
+At most twenty items, newest first. `id` never changes for an item, so a client
+can remember which one its user has read. `title` is one line of at most 120
+characters; `body` is plain text of at most 2,000, with a blank line between
+paragraphs. The items come from [`news.json`](../news.json) at the top of the
+repository, changed by pull request like everything else.
+
+The file is **not** listed in `manifest.json`: stores released before it existed
+refuse a manifest that names a file they don't know. It has its own signature
+instead: `news.sig` is the Ed25519 signature of the exact bytes of `news.json`,
+made with the same key as `manifest.sig`. A client that shows the news verifies
+it against the [public keys](#the-public-keys) first, and shows nothing when the
+file is missing or doesn't verify.
 
 ## Versions: `versions.json`
 
@@ -266,7 +354,9 @@ rely on HTTPS.
    update usually means the manifest and the file come from two different
    builds; fetch the manifest again.
 
-An app that is absent from a verified manifest is not in the catalog.
+An app that is absent from a verified manifest is not in the catalog. That
+includes an app whose file says `"status": "withdrawn"`: the file only
+replaces the old one at that address and is never named in the manifest.
 
 ### The public keys
 
@@ -301,6 +391,13 @@ should download each one once and keep it:
 3. Download the icon again only when they differ, or when you have none. When
    `icon_hash` is `null`, the app has no icon: show your placeholder.
 
+Always download from the address in `icon` or `icon_small`, exactly as given.
+It ends in `?v=` and the icon's fingerprint, so the address changes whenever
+the picture does, and a cache between you and the site can't answer with the
+previous picture. The plain addresses in [Files](#files) keep working, but a
+cache may serve an older picture from them for a few hours after an icon
+changes; don't build them yourself.
+
 An unchanged icon then costs no request at all. `icon_hash` covers both sizes,
 and it is independent of the app's version: a new release with the same image
 keeps it, and an image the developer replaces changes it. Treat it as an
@@ -308,6 +405,35 @@ opaque string; only equality matters.
 
 A client that keeps no fingerprints can still send `If-None-Match` for each
 icon, as for any other file, at the cost of one request per icon.
+
+## Mirror
+
+The whole API is published a second time at
+
+```
+https://blackbearreloaded.github.io/ps5-homebrew-catalog/api/v1/
+```
+
+for consoles on networks that can't reach `homebrew.page`. It is rebuilt and
+signed by the same deploy, a moment after the main site.
+
+- **Same files, same meaning.** `index.json`, `versions.json`, `apps/<TITLEID>.json`,
+  the icons, `manifest.json` and `manifest.sig` are all there, under the same paths.
+- **Icon addresses name the mirror.** `icon` and `icon_small` point at the mirror,
+  so a client that can only reach the mirror can still fetch icons. `page` still
+  names the website. Everything else is identical.
+- **Its own manifest and signature,** made with the same keys. Because the icon
+  addresses differ, the mirror's files have different hashes: verify a mirror
+  file against the mirror's manifest, never against the main site's. `sequence`
+  is the same number on both.
+- **Use it only as a fallback.** Ask `homebrew.page` first; use the mirror when
+  that fails. A client must accept exactly this host and path prefix, not any
+  `github.io` address.
+- **Only the API is mirrored.** There are no app pages there.
+
+GitHub Pages sets its own cache lifetime (about ten minutes) and ignores the
+site's header rules, so the [Requests](#requests) notes on caching describe the
+main site.
 
 ## Requests
 
@@ -352,6 +478,10 @@ icon, as for any other file, at the cost of one request per icon.
 | 1 | 2026-10-02 | First version: `versions.json`, `index.json`, `apps/<TITLEID>.json`, PNG icons. |
 | 2 | 2026-10-02 | Added `icon_hash` to app files and index entries, so clients can cache icons without requests. |
 | 3 | 2026-10-02 | Added `manifest.json` and `manifest.sig`: the catalog is signed. |
+| 3 | 2026-10-07 | Added `safety` to app files and `sandbox` to index entries: what the release scan found. `schema` stays 3. |
+| 3 | 2026-10-07 | `icon` and `icon_small` end in `?v=<icon_hash>`, so an icon's address changes with its picture. No field was added or renamed. |
+| 3 | 2026-10-11 | Added `added` to app files and index entries, and the signed `news.json` beside the catalog (not in the manifest). `schema` stays 3. |
+| 3 | 2026-10-05 | Added `release_notes` and `release_notes_truncated` to app files. `schema` stays 3: a released store accepts only that exact number, so it is raised with the next change that store has been prepared for. Test for the field, not for the number. |
 
 ## Where the values come from
 
@@ -359,7 +489,8 @@ icon, as for any other file, at the cost of one request per icon.
 | --- | --- | --- |
 | The eleven record fields | `apps/<TITLEID>.json`, reviewed and merged by a maintainer | On every pull request, push and in the daily health check |
 | `sha256` | The record; it must equal the digest GitHub computes for the file | Same |
-| `size`, `released`, `prerelease` | GitHub's API for the release | Read when the release is first built into the site, then cached for that file |
+| `size`, `released`, `prerelease` | GitHub's API for the release | Read when the release is first built into the site, then again at a rebuild, at most once a day |
+| `release_notes` | The release's notes in GitHub's API, reduced to plain text | Same |
 | `content_version` | `sce_sys/param.json` in the app's repository at the release tag | Same; see [App versions](versioning.md) |
 | `updated` | The record's history in this repository | Every build |
 | Icons | `icon_url`, converted to PNG | Every build, cached |

@@ -16,9 +16,9 @@ string.Template placeholders; every metadata value is HTML-escaped before it is
 substituted.
 
 Icons are fetched and re-served from the site, resized to WebP when Pillow is
-installed. With an icon cache directory, each icon URL is fetched only once
-across builds (icon URLs are pinned to a tag or commit); entries no longer used
-are pruned. A failed icon falls back to a placeholder instead of failing the
+installed. With an icon cache directory, an icon is fetched again only when its
+cached copy is older than a day (an icon URL may name a branch, where the file
+can change); entries no longer used are pruned. A failed icon falls back to a placeholder instead of failing the
 build.
 """
 
@@ -32,6 +32,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from string import Template
 from urllib.parse import quote, unquote
@@ -43,6 +44,8 @@ from .report import Report
 ROOT = Path(__file__).resolve().parents[1]
 SITE = ROOT / "site"
 REPO_URL = "https://github.com/blackbearreloaded/ps5-homebrew-catalog"
+# Likes and comments, written by the Comments workflow to a branch of their own (catalog/comments.py).
+COMMENTS_URL = REPO_URL.replace("https://github.com/", "https://raw.githubusercontent.com/") + "/comments-data/v1/"
 DEFAULT_SITE_URL = "https://homebrew.page"
 DEFAULT_BASE = "/"
 # Base paths the site used to be served under; their URLs redirect to the current base.
@@ -57,8 +60,12 @@ FONT_URL = "https://fonts.googleapis.com/css2?{families}&display=swap"
 THEMES = {
     # name: (Google Fonts families, browser theme-color)
     "holo": ("family=Unbounded:wght@500;700;800&family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,700", "#0b0b10"),
+    # ProsperoStore's look: its colours, faces and shapes (docs/website.md).
+    "farlight": ("family=Inter:wght@400;600&family=Montserrat:wght@500", "#0e0f24"),
 }
-DEFAULT_THEME = "holo"
+# Themes that show each app over a picture made from its icon's colours, as ProsperoStore does.
+AMBIENT_THEMES = {"farlight"}
+DEFAULT_THEME = "farlight"
 FORMAT_LABELS = {"zip": "ZIP folder", "ffpkg": "FFPKG image", "ffpfsc": "FFPFSC image"}
 KIND_LABELS = {"app": "App", "game": "Game", "tool": "Tool"}
 KIND_PLURALS = {"app": "Apps", "game": "Games", "tool": "Tools"}
@@ -104,6 +111,22 @@ def _git(*args: str) -> str | None:
         return None
 
 
+WITHDRAWN_DAYS = 30  # how long a withdrawn app's page keeps redirecting
+
+
+def withdrawn_titleids(apps_dir: Path, listed: set[str]) -> list[str]:
+    """Title IDs whose record was removed in the last WITHDRAWN_DAYS and isn't listed now, from git history.
+
+    Cloudflare Pages keeps serving a file for a while after a deployment drops it, so a withdrawn
+    app's page and API file would stay reachable; a redirect or a new file at the address takes
+    over at once.
+    """
+    log = _git("log", f"--since={WITHDRAWN_DAYS} days ago", "--diff-filter=D", "--name-only", "--format=",
+               "--", str(apps_dir))
+    removed = {Path(line).stem for line in (log or "").splitlines() if re.fullmatch(r".*/[A-Z]{4}[0-9]{5}\.json", line)}
+    return sorted(removed - listed)
+
+
 def last_updated(apps_dir: Path) -> dict[str, str]:
     """Map record filename to the ISO commit date of the last commit that changed it.
 
@@ -125,6 +148,25 @@ def last_updated(apps_dir: Path) -> dict[str, str]:
             date = line[1:]
         elif line and date:
             dates.setdefault(Path(line).name, date)
+    return dates
+
+
+def first_listed(apps_dir: Path) -> dict[str, str]:
+    """Map record filename to the ISO commit date of the first commit that had it: when the catalog listed it."""
+    try:
+        relative = apps_dir.resolve().relative_to(ROOT).as_posix()
+    except ValueError:
+        return {}
+    if (_git("rev-parse", "--is-shallow-repository") or "").strip() == "true":
+        _git("fetch", "--quiet", "--unshallow")
+    output = _git("log", "--format=%x00%cI", "--name-only", "--no-renames", "--", relative)
+    dates: dict[str, str] = {}
+    date = None
+    for line in (output or "").splitlines():
+        if line.startswith("\0"):
+            date = line[1:]
+        elif line and date:
+            dates[Path(line).name] = date   # the log runs newest first: the last one seen is the oldest
     return dates
 
 
@@ -191,6 +233,115 @@ def process_icon(data: bytes) -> tuple[bytes, str]:
     return output.getvalue(), "webp"
 
 
+def size_label(size: int | None) -> str:
+    """"31.8 MB", "548 GB": sizes as people say them, as ProsperoStore words them."""
+    if not size:
+        return ""
+    megabytes = size / (1024 * 1024)
+    if megabytes >= 10240:
+        return f"{megabytes / 1024:.0f} GB"
+    if megabytes >= 1024:
+        return f"{megabytes / 1024:.1f} GB"
+    return f"{megabytes:.0f} MB" if megabytes >= 10 else f"{megabytes:.1f} MB"
+
+
+def make_ambient(icon: bytes | None) -> tuple[bytes, str] | None:
+    """An app's ambient picture and main colour, from its icon: (PNG, "#rrggbb").
+
+    The same picture ProsperoStore makes (its src/app/ambient.hpp): the icon's
+    two main hues painted as soft light over the theme's dark in a 96 x 54
+    field that stays dark enough for white words. A grey icon, or none, gets
+    the theme's own violet. None without Pillow.
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    deep, violet, blue = (0x0e / 255, 0x0f / 255, 0x24 / 255), (0x42 / 255, 0x35 / 255, 0x8f / 255), (0x24 / 255, 0x4a / 255, 0xb8 / 255)
+
+    def mix(a, b, k):
+        return tuple(a[i] + (b[i] - a[i]) * k for i in range(3))
+
+    # The colourful pixels by hue, 12 buckets of 30 degrees, weighted by saturation and
+    # brightness: greys, blacks and whites do not vote.
+    sums, weights = [[0.0, 0.0, 0.0] for _ in range(12)], [0.0] * 12
+    if icon:
+        try:
+            with Image.open(io.BytesIO(icon)) as image:
+                image = image.convert("RGBA")
+                width, height = image.size
+                pixels = image.load()
+                for y in range(0, height, 4):
+                    for x in range(0, width, 4):
+                        r, g, b, a = pixels[x, y]
+                        if a < 128:
+                            continue
+                        c = (r / 255, g / 255, b / 255)
+                        hi, lo = max(c), min(c)
+                        chroma = hi - lo
+                        if hi < 0.2 or chroma < 0.18:
+                            continue
+                        if hi == c[0]:
+                            hue = ((c[1] - c[2]) / chroma + 6.0) % 6.0
+                        elif hi == c[1]:
+                            hue = (c[2] - c[0]) / chroma + 2.0
+                        else:
+                            hue = (c[0] - c[1]) / chroma + 4.0
+                        bucket = int(hue * 2.0) % 12
+                        weight = chroma * hi
+                        for i in range(3):
+                            sums[bucket][i] += c[i] * weight
+                        weights[bucket] += weight
+        except (OSError, ValueError):
+            pass
+    # The main colour is the strongest hue; the second, the strongest at least 60 degrees away
+    # with a real share of the icon.
+    first = max(range(12), key=lambda i: weights[i]) if any(weights) else -1
+    second = -1
+    if first >= 0:
+        for i in range(12):
+            apart = min((i - first) % 12, (first - i) % 12)
+            if apart >= 2 and weights[i] >= 0.12 * weights[first] and (second < 0 or weights[i] > weights[second]):
+                second = i
+
+    def colour_of(i):
+        c = tuple(v / weights[i] for v in sums[i])
+        hi = max(c)
+        return tuple(v / hi for v in c)
+
+    if first >= 0:
+        main = colour_of(first)
+        other = colour_of(second) if second >= 0 else mix(main, violet, 0.55)
+        accent = "#%02x%02x%02x" % tuple(int(v * 255 + 0.5) for v in main)
+    else:
+        main, other, accent = mix(violet, (1.0, 1.0, 1.0), 0.25), blue, "#42358f"
+
+    # Paint: the dark, the main colour high on the right (where the stage puts the icon), the
+    # second low on the left, both meeting low right.
+    width, height = 96, 54
+    aspect = width / height
+    blobs = ((main, 0.80, 0.28, 0.78, 0.82), (other, 0.14, 0.96, 0.85, 0.62), (mix(main, other, 0.5), 1.04, 1.06, 0.62, 0.5))
+    base = mix(deep, main, 0.14)
+    data = bytearray()
+    for y in range(height):
+        for x in range(width):
+            u, v = (x + 0.5) / width, (y + 0.5) / height
+            c = base
+            for colour, bx, by, radius, strength in blobs:
+                dx, dy = (u - bx) * aspect, v - by
+                d = (dx * dx + dy * dy) ** 0.5 / radius
+                if d < 1.0:
+                    c = mix(c, colour, strength * (1.0 - d * d) ** 2)
+            # Never brighter than the words allow.
+            light = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+            if light > 0.36:
+                c = tuple(v * 0.36 / light for v in c)
+            data.extend(int(min(max(v, 0.0), 1.0) * 255 + 0.5) for v in c)
+    output = io.BytesIO()
+    Image.frombytes("RGB", (width, height), bytes(data)).save(output, "PNG", optimize=True)
+    return output.getvalue(), accent
+
+
 def png_icons(data: bytes) -> dict[int, bytes]:
     """PNG copies for native clients, by longest side; they may not decode WebP. Needs Pillow to resize."""
     try:
@@ -209,17 +360,32 @@ def png_icons(data: bytes) -> dict[int, bytes]:
     return icons
 
 
+ICON_MAX_AGE = 24 * 60 * 60  # seconds a cached original is used before it is fetched again
+
+
 def _icon(url: str, cache: Path | None) -> tuple[bytes, str, bytes]:
-    """(site icon, its extension, original bytes) for url, using and filling the optional cache of originals."""
+    """(site icon, its extension, original bytes) for url, using and filling the optional cache of originals.
+
+    A cached original older than ICON_MAX_AGE is fetched again: the file behind a URL that names a
+    branch can change. When that fetch fails, the cached one is used.
+    """
     entry = cache / (hashlib.sha256(url.encode()).hexdigest() + ".img") if cache else None
+    kept = None
     if entry and entry.is_file():
         try:
             data = entry.read_bytes()
-            return (*process_icon(data), data)
+            kept = (*process_icon(data), data)
+            if time.time() - entry.stat().st_mtime < ICON_MAX_AGE:
+                return kept
         except (OSError, ValueError):
             entry.unlink(missing_ok=True)
-    data = artifacts.fetch_small(url, artifacts.MAX_ICON_BYTES)
-    result = process_icon(data)
+    try:
+        data = artifacts.fetch_small(url, artifacts.MAX_ICON_BYTES)
+        result = process_icon(data)
+    except (artifacts.DownloadError, OSError, ValueError):
+        if kept is None:
+            raise
+        return kept
     if entry:
         cache.mkdir(parents=True, exist_ok=True)
         entry.write_bytes(data)
@@ -281,9 +447,49 @@ def _write_json(path: Path, value) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n", encoding="utf-8")
 
 
+def load_scans(directory: Path | None, records: list[Record]) -> dict[str, dict]:
+    """Scan summaries by title ID, from the files a scan job wrote (one per release, named by sha256)."""
+    from .scan import read_summary
+    found: dict[str, dict] = {}
+    if not directory or not directory.is_dir():
+        return found
+    for record in records:
+        if record.reserved:
+            continue
+        entry = directory / f"{record.data['sha256']}.json"
+        try:
+            # Checked field by field: the job that wrote it handles files nobody has reviewed.
+            data = read_summary(json.loads(entry.read_text(encoding="utf-8")), record.data["sha256"])
+        except (OSError, ValueError):
+            data = None
+        if data:
+            found[record.titleid] = data
+    return found
+
+
+def safety_facts(summary: dict | None, uploader: str | None, approved: dict) -> dict | None:
+    """What the API says about a release's safety scan; None when the release wasn't scanned."""
+    if not summary or summary["sandbox"] == "unreadable":
+        return None
+    payloads = summary["payloads"]
+    return {
+        "sandbox": summary["sandbox"],                 # "stays", "leaves" or "unclear"
+        "routes": summary["routes"],                   # how it leaves: "loader", "service", "payload"
+        "helpers": len(payloads),
+        "helpers_unapproved": sum(1 for p in payloads if p["sha256"] not in approved),
+        "network": summary["network"],
+        # "attested": GitHub holds a verified statement that a workflow built this exact file.
+        # "workflow": a workflow attached the file to the release (it may have built it elsewhere).
+        "build": "attested" if summary["attested"] else "workflow" if uploader == "actions" else
+                 "developer" if uploader == "developer" else None,
+        "build_workflow": summary["workflow"],
+    }
+
+
 def write_api(root: Path, url: str, records: list[Record], report: Report, *, updated: dict[str, str], page,
               icons: dict[str, dict[int, bytes]], icon_hashes: dict[str, str], commit: str, github=None,
-              cache: Path | None = None) -> None:
+              cache: Path | None = None, known: dict | None = None, safety: dict | None = None,
+              added: dict[str, str] | None = None, news: list[dict] | None = None) -> None:
     """The store API (docs/api.md): one file per app, a browse index and a version map, plus PNG icons.
 
     Per-app files and the version map hold nothing that changes between builds
@@ -291,23 +497,29 @@ def write_api(root: Path, url: str, records: list[Record], report: Report, *, up
     304. Only the index carries the build's commit and time.
     """
     from . import facts as release_facts
+    from . import notes as release_notes
     from datetime import datetime, timezone
     large, small = API_ICON_SIZES
     index, versions = [], {}
     for record in sorted(records, key=lambda r: r.titleid):
         d, titleid, name = record.data, record.titleid, f"apps/{record.path.name}"
-        facts, problem = release_facts.cached(record, github, cache)
+        facts, problem = (known or {}).get(titleid) or release_facts.cached(record, github, cache)
         if problem:
             report.warning(name, f"release facts not included in the API this time: {problem}")
         elif github is not None and not record.reserved and facts.content_version is None:
             report.notice(name, "no contentVersion found for this release; clients can't check it for updates")
+        notes_text, notes_cut = release_notes.as_text(facts.notes)
         icon = {}
+        # The address carries the icon's fingerprint, so it changes when the picture does: a cache
+        # that still holds the previous picture can't answer for the new address.
+        fingerprint = icon_hashes.get(titleid)
+        version = f"?v={fingerprint}" if fingerprint else ""
         for size, suffix in ((large, ""), (small, f"-{small}")):
             content = icons.get(titleid, {}).get(size)
             if content:
                 (root / "icons").mkdir(parents=True, exist_ok=True)
                 (root / "icons" / f"{titleid}{suffix}.png").write_bytes(content)
-                icon[size] = f"{url}icons/{titleid}{suffix}.png"
+                icon[size] = f"{url}icons/{titleid}{suffix}.png{version}"
         app = {
             "schema": API_SCHEMA,
             **d,
@@ -320,7 +532,14 @@ def write_api(root: Path, url: str, records: list[Record], report: Report, *, up
             "released": facts.released,
             "prerelease": facts.prerelease,
             "release_url": None if record.reserved else f"{d['source_repo']}/releases/tag/{quote(record.tag, safe='')}",
+            # The developer's own words, as plain text; the full notes are at release_url.
+            "release_notes": notes_text,
+            "release_notes_truncated": notes_cut if notes_text else None,
+            # What the release scan found (docs/api.md, Safety); null when the release wasn't scanned.
+            "safety": (safety or {}).get(titleid),
             "updated": _utc(updated.get(record.path.name)),
+            # When the catalog first listed the record; null when the history can't say.
+            "added": _utc((added or {}).get(record.path.name)),
             "page": page(record),
             "icon": icon.get(large),
             "icon_small": icon.get(small) or icon.get(large),
@@ -330,13 +549,17 @@ def write_api(root: Path, url: str, records: list[Record], report: Report, *, up
         _write_json(root / "apps" / f"{titleid}.json", app)
         index.append({key: app[key] for key in (
             "titleid", "status", "name", "kind", "author", "version", "content_version", "format", "size",
-            "released", "updated", "icon_small", "icon_hash")})
+            "released", "updated", "added", "icon_small", "icon_hash")}
+            | {"sandbox": ((safety or {}).get(titleid) or {}).get("sandbox")})
         if not record.reserved:
             versions[titleid] = {"content_version": facts.content_version, "version": d["version"]}
     _write_json(root / "index.json", {
         "schema": API_SCHEMA, "generated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "commit": commit, "count": len(index), "apps": index})
     _write_json(root / "versions.json", {"schema": API_SCHEMA, "apps": versions})
+    # The news is signed by itself and stays out of the manifest (catalog/news.py).
+    from . import news as catalog_news
+    _write_json(root / catalog_news.FILE, {"schema": API_SCHEMA, "news": (news or [])[:catalog_news.PUBLISHED]})
     # Hashes of everything above, for the deploy to sign (catalog/signing.py).
     from . import signing
     signing.write_manifest(root, API_SCHEMA, source_sequence(), commit)
@@ -346,7 +569,8 @@ def write_api(root: Path, url: str, records: list[Record], report: Report, *, up
 
 def build_site(out: Path, apps_dir: Path, report: Report, base: str = DEFAULT_BASE,
                site_url: str = DEFAULT_SITE_URL, fetch_icons: bool = True,
-               theme: str = DEFAULT_THEME, icon_cache: Path | None = None, github=None) -> int:
+               theme: str = DEFAULT_THEME, icon_cache: Path | None = None, github=None,
+               scans: Path | None = None, pages_url: str | None = None) -> int:
     """Build the site. With `github`, release facts for the API are looked up (and kept in the cache)."""
     theme_obj = Theme(theme)
     records = load_catalog(apps_dir, report)
@@ -362,18 +586,24 @@ def build_site(out: Path, apps_dir: Path, report: Report, base: str = DEFAULT_BA
     root.mkdir(parents=True, exist_ok=True)
     assets = Assets(root / "assets", base + "assets/")
     shared_dir = SITE / "shared"
-    css = assets.add(f"{theme}", "css", (theme_obj.directory / "style.css").read_bytes())
-    js = assets.add("app", "js", (shared_dir / "app.js").read_bytes())
+    # A theme may bring its own script and favicon; otherwise the shared ones are used.
+    own = {name: theme_obj.directory / name for name in ("app.js", "favicon.svg")}
+    js = assets.add("app", "js", (own["app.js"] if own["app.js"].is_file() else shared_dir / "app.js").read_bytes())
     placeholder = assets.add("placeholder", "svg", (shared_dir / "placeholder.svg").read_bytes())
-    shutil.copyfile(shared_dir / "favicon.svg", root / "favicon.svg")
+    shutil.copyfile(own["favicon.svg"] if own["favicon.svg"].is_file() else shared_dir / "favicon.svg",
+                    root / "favicon.svg")
 
     icons: dict[str, str] = {}
     api_icons: dict[str, dict[int, bytes]] = {}
     icon_hashes: dict[str, str] = {}
     # A reservation has no icon of its own yet: it gets the shared "coming soon" picture.
-    coming_soon = assets.add("coming-soon", *reversed(process_icon((shared_dir / "coming-soon.png").read_bytes())))
+    coming_soon_source = (shared_dir / "coming-soon.png").read_bytes()
+    coming_soon = assets.add("coming-soon", *reversed(process_icon(coming_soon_source)))
+    originals: dict[str, bytes] = {}
     for record in records:
         icons[record.titleid] = coming_soon if record.reserved else placeholder
+        if record.reserved:
+            originals[record.titleid] = coming_soon_source
         if not fetch_icons or record.data["icon_url"] is None:
             continue
         try:
@@ -384,6 +614,26 @@ def build_site(out: Path, apps_dir: Path, report: Report, base: str = DEFAULT_BA
             report.warning(f"apps/{record.path.name}", f"icon not included, using a placeholder: {error}")
             continue
         icons[record.titleid] = assets.add(f"icon-{record.titleid}", extension, content)
+        originals[record.titleid] = original
+
+    # Each app's ambient picture and main colour, for the themes that show them. The colours
+    # go into the stylesheet as one rule per app: the pages carry no inline styles.
+    ambients: dict[str, str] = {}
+    accents: dict[str, str] = {}
+    style = (theme_obj.directory / "style.css").read_bytes()
+    if theme in AMBIENT_THEMES:
+        plain = make_ambient(None)
+        for record in records:
+            made = make_ambient(originals.get(record.titleid)) if record.titleid in originals else plain
+            if made is None:      # no Pillow: the theme's own picture and colour
+                ambients[record.titleid] = assets.add("ambient", "png", (theme_obj.directory / "field.png").read_bytes())
+                accents[record.titleid] = "#42358f"
+                continue
+            ambients[record.titleid] = assets.add(f"ambient-{record.titleid}", "png", made[0])
+            accents[record.titleid] = made[1]
+        style += b"\n/* Each app's main colour, from its icon. */\n" + "".join(
+            f".tone-{titleid}{{--tone:{colour}}}\n" for titleid, colour in sorted(accents.items())).encode()
+    css = assets.add(f"{theme}", "css", style)
     if icon_cache and icon_cache.is_dir() and fetch_icons:
         wanted = {hashlib.sha256(r.data["icon_url"].encode()).hexdigest() + ".img"
                   for r in records if r.data["icon_url"]}
@@ -394,6 +644,70 @@ def build_site(out: Path, apps_dir: Path, report: Report, base: str = DEFAULT_BA
     kinds = {kind: [r for r in records if r.data["kind"] == kind] for kind in KINDS}
     total = len(records)
     updated = last_updated(apps_dir)
+    added = first_listed(apps_dir)
+    from . import news as catalog_news
+    news_items = catalog_news.load(ROOT / catalog_news.FILE, report)
+    # Release facts (size, dates), asked once: the pages show the size, the API publishes all.
+    from . import facts as release_facts
+    from . import notes as release_notes
+    known = {r.titleid: release_facts.cached(r, github, icon_cache) for r in records}
+    from .scan import load_approved
+    approved = load_approved()
+    summaries = load_scans(scans, records)
+    safety = {r.titleid: safety_facts(summaries.get(r.titleid), known[r.titleid][0].uploader, approved)
+              for r in records if not r.reserved}
+
+    def safety_section(record: Record) -> str:
+        """The "Safety" part of an app's page; nothing when the release wasn't scanned."""
+        facts = safety.get(record.titleid)
+        if not facts:
+            return ""
+        sandbox = {"stays": ("good", "Stays in the sandbox", "The scan found no way for this app to reach beyond "
+                             "its own files: no payload, no connection to the payload loader, no request to a "
+                             "jailbreak service."),
+                   "leaves": ("care", "Leaves the sandbox", "This app can get full access to the console, usually "
+                              "to read and write files outside its own folder. Install it only if you trust its "
+                              "developer."),
+                   "unclear": ("care", "Sandbox: unclear", "The scan found weak signs that this app may reach the "
+                               "payload loader, and could not settle it.")}[facts["sandbox"]]
+        chips = [f'<li class="safety__chip safety__chip--{sandbox[0]}">{sandbox[1]}</li>']
+        lines = [sandbox[2]]
+        if facts["helpers"]:
+            if facts["helpers_unapproved"]:
+                chips.append(f'<li class="safety__chip safety__chip--care">{facts["helpers_unapproved"]} helper(s) not reviewed</li>')
+                lines.append(f"It ships {facts['helpers']} helper program(s) that run outside the sandbox; "
+                             f"{facts['helpers_unapproved']} of them the catalog's maintainers have not read.")
+            else:
+                chips.append('<li class="safety__chip safety__chip--good">Helpers reviewed</li>')
+                lines.append(f"It ships {facts['helpers']} helper program(s) that run outside the sandbox, all "
+                             "on the catalog's list of reviewed helpers.")
+        build = {"attested": ("good", "Built by GitHub Actions", "GitHub holds a signed statement that a workflow of "
+                              "the app's repository built exactly this file."),
+                 "workflow": ("plain", "Released by a workflow", "A workflow of the app's repository attached this "
+                              "file to the release. Nothing proves where it was built."),
+                 "developer": ("plain", "Built by the developer", "The developer built and uploaded this file by "
+                               "hand. Nothing ties it to the published source.")}.get(facts["build"])
+        if build:
+            chips.append(f'<li class="safety__chip safety__chip--{build[0]}">{build[1]}</li>')
+            lines.append(build[2])
+        text = "".join(f"<p>{e(line)}</p>" for line in lines)
+        return ('<h2 id="safety-title">Safety</h2>\n'
+                f'<ul class="safety" aria-label="Scan results">{"".join(chips)}</ul>\n'
+                f'<div class="safety__text">{text}<p class="notes__source">From an automatic scan of the release '
+                'file, which is read and never run. It can miss things: it is not a guarantee. '
+                '<a href="https://github.com/blackbearreloaded/ps5-homebrew-catalog/blob/main/docs/automation.md#release-scan">'
+                'How the scan works</a></p></div>')
+
+    def notes_section(record: Record, release_url: str) -> str:
+        """The "Release notes" part of an app's page; nothing when the release has no notes."""
+        body, cut = release_notes.as_html(known[record.titleid][0].notes)
+        if not body:
+            return ""
+        more = "Read the full notes on GitHub" if cut else "See this release on GitHub"
+        return ('<h2 id="notes-title">Release notes</h2>\n'
+                f'<div class="notes">\n{body}\n</div>\n'
+                f'<p class="notes__source">Written by {e(record.data["author"])} for {e(version_label(record.data["version"]))}. '
+                f'<a href="{e(release_url)}" rel="nofollow">{more}</a></p>')
 
     def page_url(record: Record) -> str:
         return f"{base}app/{record.titleid}/"
@@ -407,6 +721,9 @@ def build_site(out: Path, apps_dir: Path, report: Report, base: str = DEFAULT_BA
             kind_label=e(KIND_LABELS[d["kind"]]),
             status="soon" if record.reserved else "available",
             format="",
+            ambient=e(ambients.get(record.titleid, "")),
+            accent=e(accents.get(record.titleid, "")),
+            size_label=e(size_label(known[record.titleid][0].size)),
         )
         if not record.reserved:
             fmt = artifact_format(record)
@@ -418,6 +735,11 @@ def build_site(out: Path, apps_dir: Path, report: Report, base: str = DEFAULT_BA
                 version_label=e(version_label(d["version"])),
                 release_url=e(f"{d['source_repo']}/releases/tag/{d['artifact_url'].split('/releases/download/')[1].split('/')[0]}"),
                 tag=e(record.tag),
+                # Finds the app's discussion by its title ID; the page's script swaps in the exact address.
+                comments_search=e(f"{REPO_URL}/discussions?discussions_q={record.titleid}"),
+                safety=safety_section(record),
+                notes=notes_section(
+                    record, f"{d['source_repo']}/releases/tag/{d['artifact_url'].split('/releases/download/')[1].split('/')[0]}"),
             )
         values.update(
             number=f"{number:03d}",
@@ -449,6 +771,7 @@ def build_site(out: Path, apps_dir: Path, report: Report, base: str = DEFAULT_BA
     shared = {
         "base": base,
         "repo": REPO_URL,
+        "comments_url": COMMENTS_URL,
         "submit_url": f"{REPO_URL}/blob/main/docs/submitting.md",
         "css": css,
         "js": js,
@@ -536,6 +859,8 @@ def build_site(out: Path, apps_dir: Path, report: Report, base: str = DEFAULT_BA
             shared, canonical=e(site_url + base + "tv/"), rail=rail_html,
             tv_css=assets.add(f"{theme}-tv", "css", (theme_obj.directory / "tv.css").read_bytes()),
             tv_js=assets.add("tv", "js", (shared_dir / "tv.js").read_bytes()),
+            # qrcode-generator (MIT), unchanged: tv.js draws the QR codes of the detail view with it.
+            tv_qr=assets.add("qrcode", "js", (shared_dir / "qrcode.js").read_bytes()),
             # Inside <script type="application/json">, "<" is escaped so no value can close the element.
             data=data.replace("<", "\\u003c"),
         ), encoding="utf-8")
@@ -567,13 +892,17 @@ def build_site(out: Path, apps_dir: Path, report: Report, base: str = DEFAULT_BA
         json.dumps(feed, ensure_ascii=False, separators=(",", ":")) + "\n", encoding="utf-8")
 
     write_api(root / "api" / API_VERSION, f"{site_url}{base}api/{API_VERSION}/", records, report,
-              updated=updated, page=lambda r: site_url + page_url(r), icons=api_icons, icon_hashes=icon_hashes,
+              updated=updated, icons=api_icons, icon_hashes=icon_hashes,
+              # A mirror of the API has no pages of its own: its `page` links go to the website.
+              page=lambda r: (pages_url.rstrip("/") + f"/app/{r.titleid}/") if pages_url else site_url + page_url(r),
               commit=commit,
-              github=github, cache=icon_cache)
+              github=github, cache=icon_cache, known=known, safety=safety,
+              added=added, news=news_items)
 
     # Cloudflare Pages configuration.
     csp = ("default-src 'self'; img-src 'self' data:; style-src 'self' https://fonts.googleapis.com; "
-           "font-src https://fonts.gstatic.com; script-src 'self'; connect-src 'self'; "
+           "font-src https://fonts.gstatic.com; script-src 'self'; "
+           "connect-src 'self' https://raw.githubusercontent.com; "
            "base-uri 'self'; form-action 'none'; frame-ancestors 'none'")
     (out / "_headers").write_text(f"""/*
   X-Content-Type-Options: nosniff
@@ -595,6 +924,9 @@ def build_site(out: Path, apps_dir: Path, report: Report, base: str = DEFAULT_BA
 
 {base}api/*/manifest.sig
   Content-Type: application/octet-stream
+
+{base}api/*/news.sig
+  Content-Type: application/octet-stream
 """, encoding="utf-8")
     redirects = [f"/ {base} 302", f"{base.rstrip('/')} {base} 301"] if base != "/" else []
     redirects += [f"{base}list {base}?view=list 301", f"{base}list/ {base}?view=list 301",
@@ -603,6 +935,12 @@ def build_site(out: Path, apps_dir: Path, report: Report, base: str = DEFAULT_BA
         if old != base:
             redirects += [f"{old}list {base}?view=list 301", f"{old}list/ {base}?view=list 301",
                           f"{old.rstrip('/')} {base} 301", f"{old}* {base}:splat 301"]
+    for titleid in withdrawn_titleids(apps_dir, {r.titleid for r in records}):
+        redirects += [f"{base}app/{titleid}/ {base} 302", f"{base}app/{titleid} {base} 302"]
+        # Its API file is replaced as well. Written after the manifest and so not named in it:
+        # an app that is absent from the manifest is not in the catalog.
+        _write_json(root / "api" / API_VERSION / "apps" / f"{titleid}.json",
+                    {"schema": API_SCHEMA, "titleid": titleid, "status": "withdrawn"})
     (out / "_redirects").write_text("\n".join(redirects) + "\n", encoding="utf-8")
     (out / "robots.txt").write_text("User-agent: *\nAllow: /\n", encoding="utf-8")
     return total

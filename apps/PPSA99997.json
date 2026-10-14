@@ -1,0 +1,13 @@
+{
+  "titleid": "PPSA99997",
+  "name": "Nuvio PS5",
+  "kind": "app",
+  "description": "Nuvio TV for a jailbroken PS5, with EVO native playback and the interface served by the console itself.",
+  "license": "GPL-3.0",
+  "author": "Bilawal Riaz",
+  "version": "0.1.0-alpha.7",
+  "source_repo": "https://github.com/bilawalriaz/nuvio-ps5-homebrew",
+  "artifact_url": "https://github.com/bilawalriaz/nuvio-ps5-homebrew/releases/download/v0.1.0-alpha.7/PPSA99997.zip",
+  "sha256": "8c56ca5149d39fab1e4e4f8650f25e20d49e655374769765dca8c30ae2385eca",
+  "icon_url": "https://raw.githubusercontent.com/bilawalriaz/nuvio-ps5-homebrew/v0.1.0-alpha.7/assets/icon.png"
+}

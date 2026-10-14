@@ -12,8 +12,8 @@ then reviews and merges it.
 - A **public GitHub repository** for the app, with a license GitHub can detect.
 - A **published GitHub release** in that repository, tagged with the app's
   version (for example `v1.2.0` or `01.000.005`), with a **release artifact**
-  (`.zip`, `.ffpfsc` or `.ffpkg`, see [artifact formats](artifact-formats.md))
-  attached to it. Pre-releases are accepted; files in the repository, drafts,
+  attached to it: a `.zip` of the app folder, the only format accepted at the
+  moment (see [artifact formats](artifact-formats.md)). Pre-releases are accepted; files in the repository, drafts,
   CI artifacts and other download sites aren't. The release tag **is** the
   version the catalog shows.
 - A **`contentVersion` you raise in every release**, in `sce_sys/param.json`
@@ -46,8 +46,9 @@ four uppercase letters followed by five digits.
 
 ## 2. Publish the artifact
 
-Build one of the supported [artifact formats](artifact-formats.md): a `.zip`
-of the `<TITLEID>/` app folder, a `.ffpfsc` image, or a `.ffpkg`.
+Build a `.zip` of the `<TITLEID>/` app folder, with that folder at the top of
+the archive. It is the only [artifact format](artifact-formats.md) accepted at
+the moment; `.ffpkg` and `.ffpfsc` images aren't.
 
 Attach it to a [GitHub release](https://docs.github.com/en/repositories/releasing-projects-on-github/managing-releases-in-a-repository)
 and publish the release (a draft isn't downloadable). Name the tag after the
@@ -60,6 +61,11 @@ Before you build, raise `contentVersion` in `sce_sys/param.json` and commit
 it, so the tag points at the value the release ships. Tagging releases with
 the content version itself (`01.000.005`) keeps everything in one number.
 [App versions](versioning.md) has the rules and a release checklist.
+
+Write the release's description with care: it becomes your app's release
+notes on the website and in the store. Put what changed first, under short
+headings with bullet lists; images, links and HTML aren't carried over. See
+[Write release notes](../README.md#write-release-notes).
 
 Use a new tag and a new asset for every version; never replace the asset of a
 release that is already listed, because its sha256 would no longer match. Enabling GitHub's
@@ -181,7 +187,7 @@ your repository.
 | --- | --- |
 | `does not own` | Open the PR from the repository owner's account, or make your organization membership public. |
 | `sha256 does not match` | Recompute the digest of the exact asset in `artifact_url`. |
-| `artifact_url must be` | Link a specific release asset ending in `.zip`, `.ffpfsc` or `.ffpkg`. |
+| `artifact_url must be` | Link a specific release asset ending in `.zip`. |
 | `version must match the release tag` | Set `version` to the tag in `artifact_url`, optionally without its leading `v`. |
 | `no contentVersion found` (warning) | Commit `sce_sys/param.json` with your `titleId` and a `contentVersion` like `01.000.070`, or tag releases with the content version. See [App versions](versioning.md). |
 | `contentVersion … is not higher` (warning) | Raise `contentVersion` in every release; consoles compare it to find updates. |

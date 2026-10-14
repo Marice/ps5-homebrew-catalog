@@ -64,6 +64,214 @@ def cmd_verify(args) -> int:
     return report.emit("Catalog verification", f"{len(selected)} record(s) verified.")
 
 
+def _report_scan(scan, name: str, title: str, report: Report) -> None:
+    """Put a scan's findings in the report (errors and warnings) and its full text in the job summary."""
+    from .scan import markdown
+    for level, text in scan.findings:
+        if level != "notice":
+            getattr(report, level)(name, text.replace("`", ""))
+    report.notice(name, f"release scan: {scan.verdict}; the full report is in the job summary")
+    text = markdown(scan, title)
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a", encoding="utf-8") as handle:
+            handle.write(text + "\n")
+    else:
+        print(text)
+
+
+def cmd_scan(args) -> int:
+    """Scan the release archive of listed apps, or a ZIP file on disk."""
+    from .scan import check_helpers, load_approved, scan_archive, scan_release
+    report = Report()
+    approved = load_approved()
+    if args.zip:
+        if len(args.titleids) != 1:
+            report.error("scan", "--zip needs exactly one title ID: the folder the archive should hold")
+        else:
+            titleid = args.titleids[0].upper()
+            scan = scan_archive(Path(args.zip), titleid)
+            check_helpers(scan, approved)
+            _report_scan(scan, args.zip, titleid, report)
+        return report.emit("Release scan", "Scanned.")
+    records = [r for r in load_catalog(APPS, report) if not r.reserved]
+    wanted = {t.upper() for t in args.titleids}
+    for titleid in sorted(wanted - {r.titleid for r in records}):
+        report.error(f"apps/{titleid}.json", "no listed app with this title ID")
+    selected = [r for r in records if not wanted or r.titleid in wanted]
+    rows = []       # one line per release, for the overview of a scan of several
+    with tempfile.TemporaryDirectory(prefix="catalog-scan-") as tmp:
+        for record in selected:
+            name = f"apps/{record.path.name}"
+            if not record.asset_name.lower().endswith(".zip"):
+                report.notice(name, "not a ZIP archive; not scanned")
+                rows.append((record, None, 0))
+                continue
+            scan = scan_release(record.data, Path(tmp), attest=True)
+            if args.helpers:
+                # Entries for helpers/approved.json, to paste after reading each helper's source.
+                for info in scan.payloads:
+                    if info.sha256 not in approved:
+                        print(json.dumps({"sha256": info.sha256, "name": f"{record.data['name']}: "
+                                          f"{info.path.rsplit('/', 1)[-1]}", "titleid": record.titleid,
+                                          "version": record.data["version"], "source": record.data["source_repo"]}) + ",")
+                continue
+            unapproved = check_helpers(scan, approved)
+            rows.append((record, scan, unapproved))
+            _report_scan(scan, name, f"{record.data['name']} ({record.titleid}) {record.data['version']}", report)
+    if len(rows) > 1 and not args.helpers:
+        _scan_overview(rows)
+    return report.emit("Release scan", f"{len(selected)} release(s) scanned.")
+
+
+def _scan_overview(rows) -> None:
+    """One table for a scan of several releases: where each app stands."""
+    words = {"stays": "stays in the sandbox", "leaves": "leaves the sandbox", "unclear": "unclear",
+             "unreadable": "not scanned"}
+    lines = ["## Overview", "", "| App | Title ID | Version | Sandbox | How | Helpers | Not reviewed | Build attested |",
+             "| --- | --- | --- | --- | --- | ---: | ---: | --- |"]
+    counts: dict[str, int] = {}
+    for record, scan, unapproved in rows:
+        d = record.data
+        if scan is None:
+            verdict, how, helpers, attested = "not scanned (not a ZIP)", "", "", ""
+        else:
+            verdict, how = words[scan.sandbox], ", ".join(scan.routes)
+            helpers = str(len(scan.payloads)) if scan.downloaded else ""
+            attested = {True: "yes", False: "no", None: "not checked"}[scan.attested] if scan.downloaded else ""
+        counts[verdict] = counts.get(verdict, 0) + 1
+        lines.append(f"| {d['name'].replace('|', ' ')} | `{d['titleid']}` | {d['version']} | {verdict} | {how} | "
+                     f"{helpers} | {unapproved if scan is not None and unapproved else ''} | {attested} |")
+    lines += ["", "Totals: " + ", ".join(f"{n} {word}" for word, n in sorted(counts.items(), key=lambda c: -c[1])) + ".", ""]
+    text = "\n".join(lines) + "\n"
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a", encoding="utf-8") as handle:
+            handle.write(text)
+    else:
+        print(text)
+
+
+def cmd_scan_all(args) -> int:
+    """CI: a summary of every listed release's scan, for the website and the store API.
+
+    A summary is kept by the file's sha256, so a release is downloaded and scanned once. The job
+    that runs this handles unreviewed files and has no secrets; the build reads its output as data.
+    """
+    from .scan import SCANNER, read_summary, scan_release, summary
+    report = Report()
+    cache, out = Path(args.cache), Path(args.out)
+    cache.mkdir(parents=True, exist_ok=True)
+    out.mkdir(parents=True, exist_ok=True)
+    records = [r for r in load_catalog(APPS, Report()) if not r.reserved and r.asset_name.lower().endswith(".zip")]
+    scanned = 0
+    with tempfile.TemporaryDirectory(prefix="catalog-scan-") as tmp:
+        for record in records:
+            sha256 = record.data["sha256"]
+            kept = cache / f"{sha256}.json"
+            data = None
+            if kept.is_file():
+                try:
+                    data = read_summary(json.loads(kept.read_text(encoding="utf-8")), sha256)
+                except (OSError, ValueError):
+                    data = None
+            if data is None:
+                scan = scan_release(record.data, Path(tmp), attest=True)
+                scanned += 1
+                if not scan.downloaded or scan.sha256 != sha256:
+                    report.warning(f"apps/{record.path.name}", "not scanned: " + scan.verdict
+                                   if not scan.downloaded else "not scanned: the file is not the listed one")
+                    continue
+                data = summary(scan)
+                kept.write_text(json.dumps(data), encoding="utf-8")
+                report.notice(f"apps/{record.path.name}", f"scanned: {scan.verdict}")
+            (out / f"{sha256}.json").write_text(json.dumps(data), encoding="utf-8")
+    wanted = {f"{r.data['sha256']}.json" for r in records}
+    for entry in cache.glob("*.json"):
+        if entry.name not in wanted:
+            entry.unlink()
+    return report.emit("Release scans", f"{len(records)} release(s), {scanned} scanned now (scanner {SCANNER}).")
+
+
+def cmd_scan_pr(args) -> int:
+    """CI: scan the releases a pull request lists. Base-branch code; PR files are read only as data.
+
+    The job that runs this has no secrets and a read-only token: it downloads files nobody has
+    reviewed. Only an archive that is unsafe to unpack fails the check; everything else is a report
+    for the reviewer.
+    """
+    from .records import record_problems
+    from .scan import check_helpers, compare, load_approved, scan_release
+    approved = load_approved()
+    event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))
+    pull = event["pull_request"]
+    head = "refs/catalog/pr-head"
+    git("fetch", "--no-tags", "--quiet", "origin", f"+refs/pull/{pull['number']}/head:{head}")
+    base = git("merge-base", "HEAD", head).strip()
+    report = Report()
+    scanned = 0
+    # What keeps a developer's release bump from being merged without a maintainer (`catalog
+    # automerge`): a helper nobody approved, and what is new since the listed release. Findings
+    # the listed release had too were read when it was listed, so they don't count; without a
+    # listed release to compare with, every warning does.
+    findings = 0
+    with tempfile.TemporaryDirectory(prefix="catalog-scan-") as tmp:
+        for change in diff_changes(base, head):
+            if change.status == "D" or not RECORD_PATH.fullmatch(change.path):
+                continue
+            if int(git("cat-file", "-s", f"{head}:{change.path}")) > MAX_FILE_BYTES:
+                continue
+            try:
+                data = json.loads(git_bytes("show", f"{head}:{change.path}").decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                continue        # the submission check reports a record that can't be read
+            if not isinstance(data, dict) or record_problems(data) or data.get("artifact_url") is None:
+                continue
+            if Path(change.path).stem != data["titleid"]:
+                continue
+            old_path = ROOT / change.path
+            listed = None
+            if old_path.is_file():
+                try:
+                    listed = json.loads(old_path.read_text(encoding="utf-8"))
+                    if listed.get("sha256") == data["sha256"]:
+                        continue        # the same file as listed: nothing new to scan
+                except ValueError:
+                    listed = None
+            if not data["artifact_url"].lower().endswith(".zip"):
+                report.notice(change.path, "not a ZIP archive; not scanned")
+                continue
+            scanned += 1
+            scan = scan_release(data, Path(tmp), attest=True)
+            findings += check_helpers(scan, approved)
+            if not scan.downloaded or scan.failed:
+                findings += 1
+            if scan.attested is False:
+                report.notice(change.path, "no verified build attestation: nothing ties this file to a workflow run")
+            # An update: scan the listed release too and say what changed.
+            if (scan.downloaded and isinstance(listed, dict) and not record_problems(listed)
+                    and str(listed.get("artifact_url") or "").lower().endswith(".zip")):
+                before = scan_release(listed, Path(tmp))
+                if before.downloaded and not before.failed:
+                    scan.compared_with = f"the listed release, {listed['version']}"
+                    scan.comparison = compare(before, scan)
+                    for line in scan.comparison:
+                        if line.startswith("**") or line.startswith("New payload") or line.startswith("Payload"):
+                            report.warning(change.path, "since the listed release: " + line.replace("*", "").replace("`", ""))
+                        # A payload that changed is counted above when its new build is not approved.
+                        if line.startswith("**") or line.startswith("New payload"):
+                            findings += 1
+            warnings = report.count("warning")
+            _report_scan(scan, change.path, f"{data['name']} ({data['titleid']}) {data['version']}", report)
+            if not scan.compared_with:
+                findings += report.count("warning") - warnings
+    output = os.environ.get("GITHUB_OUTPUT")
+    if output:
+        with open(output, "a", encoding="utf-8") as handle:
+            handle.write(f"findings={findings}\n")
+    return report.emit("Release scan", f"{scanned} release(s) scanned; the reports are above.")
+
+
 HEALTH_SLICES = 7
 
 
@@ -196,8 +404,75 @@ def cmd_pr(args) -> int:
                                              "a maintainer will review it.")
 
 
+def cmd_automerge(args) -> int:
+    """CI: merge a pull request that only moves the author's own app to its newest release.
+
+    Base-branch code; the pull request's files are read only as data. It runs after the submission
+    check and the release scan passed, and merges only when neither had a warning. Whatever it
+    decides, it never fails the pull request: a pull request it leaves alone waits for a maintainer.
+    """
+    from .automerge import bump_reasons
+    event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))
+    pull = event["pull_request"]
+    number, author, sha = pull["number"], pull["user"]["login"], pull["head"]["sha"]
+    name = f"pull request #{number}"
+    report = Report()
+    reasons = []
+    if pull.get("draft"):
+        reasons.append("it is a draft")
+    if (pull.get("base") or {}).get("ref") != "main":
+        reasons.append("it does not target main")
+    for variable, check, what in (("SUBMISSION_WARNINGS", "submission check", "warning(s)"),
+                                  ("SCAN_FINDINGS", "release scan", "new or unapproved finding(s)")):
+        count = os.environ.get(variable, "")
+        if count != "0":
+            reasons.append(f"the {check} has {count} {what} to read" if count.isdigit()
+                           else f"the {check} did not report its result")
+
+    head = "refs/catalog/pr-head"
+    git("fetch", "--no-tags", "--quiet", "origin", f"+refs/pull/{number}/head:{head}")
+    if git("rev-parse", head).strip() != sha:
+        reasons.append("it changed while it was being checked")
+    changes = diff_changes(git("merge-base", "HEAD", head).strip(), head)
+    old = new = None
+    if len(changes) == 1 and changes[0].status == "M" and RECORD_PATH.fullmatch(changes[0].path):
+        path = changes[0].path
+        if int(git("cat-file", "-s", f"{head}:{path}")) <= MAX_FILE_BYTES and (ROOT / path).is_file():
+            old = load_record(ROOT / path, Report())
+            with tempfile.TemporaryDirectory(prefix="catalog-bump-") as tmp:
+                proposed = Path(tmp) / Path(path).name
+                proposed.write_bytes(git_bytes("show", f"{head}:{path}"))
+                new = load_record(proposed, Report())
+    reasons += bump_reasons(author, changes, old, new, GitHub())
+
+    output = os.environ.get("GITHUB_OUTPUT")
+    if output:
+        with open(output, "a", encoding="utf-8") as handle:
+            handle.write(f"eligible={'false' if reasons else 'true'}\n")
+    if reasons:
+        for reason in reasons:
+            report.notice(name, "left for a maintainer: " + reason)
+        return report.emit("Automatic merge", "Nothing was merged.")
+    if not args.merge:
+        report.notice(name, f"@{author} moves their own app to its newest release, and no check had a warning")
+        return report.emit("Automatic merge", "This pull request can be merged without a maintainer.")
+    bot = GitHub(os.environ["MERGE_TOKEN"])
+    repository = os.environ["GITHUB_REPOSITORY"]
+    try:
+        bot.approve_pull(repository, number, sha,
+                         "A release bump by the app's developer: only the version, file, sha256 and icon "
+                         "changed, the release is the newest of the app's repository, and the submission "
+                         "check and the release scan passed without a warning. Merged automatically; it is "
+                         "published with the catalog's next publication.")
+        bot.merge_pull(repository, number, sha, f"{pull['title']} (#{number})")
+        report.notice(name, f"merged: @{author} moved their own app to its newest release")
+    except GitHubError as error:
+        report.warning(name, f"meets every rule, but could not be merged: {error}")
+    return report.emit("Automatic merge", "Done.")
+
+
 UPDATE_BRANCH = "catalog-update/all"
-# The pull request body records which release it proposes for each app, so a later run can tell what was rejected.
+# The pull request body records which release it proposes for each app.
 UPDATE_STATE = re.compile(r"<!-- catalog-updates: (\{.*?\}) -->")
 
 
@@ -241,43 +516,24 @@ def updates_pr_text(updates: list) -> tuple[str, str]:
         "",
         *[update_section(u) + "\n" for u in updates],
         "The submission check verifies every record in this pull request. Merge it to publish the updates. "
-        "Closing it without merging skips these versions: none of them is proposed again, and each app "
-        "comes back with its next release.",
+        "Closing it without merging rejects nothing: the next run proposes every pending update again.",
         "",
         f"<!-- catalog-updates: {state} -->",
     ])
     return title, body
 
 
-def rejected_updates(repository: str, github: GitHub) -> set[tuple[str, str]]:
-    """(title ID, tag) pairs of update pull requests that were closed without merging."""
-    rejected = set()
-    for body in github.closed_pull_bodies(repository, UPDATE_BRANCH):
-        match = UPDATE_STATE.search(body)
-        if not match:
-            continue
-        try:
-            rejected.update(json.loads(match.group(1)).items())
-        except ValueError:
-            continue
-    return rejected
-
-
 def open_updates_pr(updates: list, repository: str, github: GitHub, report: Report) -> None:
-    """Keep one pull request, on one branch, with every pending update; rebuild it when the set changes."""
+    """Keep one pull request, on one branch, with every pending update; rebuild it when the set changes.
+
+    Every run proposes all pending updates, also those of a pull request that was closed without merging.
+    """
     from .updates import render
-    rejected = rejected_updates(repository, github)
-    kept = []
-    for update in updates:
-        if (update.record.titleid, update.tag) in rejected:
-            report.notice(f"apps/{update.record.path.name}",
-                          f"skipped: an update to {update.tag} was closed without merging")
-        else:
-            kept.append(update)
+    kept = updates
     existing = github.open_pull(repository, UPDATE_BRANCH)
     if not kept:
         if existing:
-            # Its updates reached main some other way. The marker is dropped so closing it rejects nothing.
+            # Its updates reached main some other way.
             github.update_pull(repository, existing["number"], existing.get("title", "Update apps"),
                                "Closed by the release check: there is nothing left to update.")
             github.close_pull(repository, existing["number"])
@@ -315,17 +571,85 @@ def open_updates_pr(updates: list, repository: str, github: GitHub, report: Repo
         report.notice("updates", f"opened pull request #{pull.get('number')}: {title}")
 
 
+REMOVAL_BRANCH = "catalog-update/removals"
+
+
+def removals_pr_text(gone: list) -> tuple[str, str]:
+    """Title and body of the one pull request that withdraws every listed app whose source is gone."""
+    names = [record.data["name"] for record, _ in gone]
+    if len(names) == 1:
+        title = f"Withdraw {names[0]}: its source is gone"
+    else:
+        shown = ", ".join(names[:3]) + (f" and {len(names) - 3} more" if len(names) > 3 else "")
+        title = f"Withdraw {len(names)} apps whose source is gone: {shown}"
+    body = "\n".join([
+        f"Automated proposal from the daily release check: {len(gone)} listed app(s) can no longer be installed.",
+        "",
+        *[f"- **{record.data['name']}** (`{record.titleid}`), {record.data['source_repo']}: {reason}."
+          for record, reason in gone],
+        "",
+        "Merge it to remove these records from the catalog. Closing it without merging rejects nothing: "
+        "the next run proposes it again while the source stays gone, and an app that comes back drops "
+        "out of this pull request.",
+    ])
+    return title, body
+
+
+def open_removals_pr(gone: list, repository: str, github: GitHub, report: Report) -> None:
+    """Keep one pull request that removes every listed app whose source is gone; close it when none is."""
+    existing = github.open_pull(repository, REMOVAL_BRANCH)
+    if not gone:
+        if existing:
+            github.update_pull(repository, existing["number"], existing.get("title", "Withdraw apps"),
+                               "Closed by the release check: the source of every listed app is there.")
+            github.close_pull(repository, existing["number"])
+            report.notice("removals", f"closed pull request #{existing['number']}: nothing left to withdraw")
+        return
+
+    title, body = removals_pr_text(gone)
+    paths = sorted(f"apps/{record.path.name}" for record, _ in gone)
+    git("fetch", "--quiet", "origin", "main")
+    if existing:
+        git("fetch", "--quiet", "origin", f"+refs/heads/{REMOVAL_BRANCH}:refs/remotes/origin/{REMOVAL_BRANCH}")
+        if sorted(git("diff", "--name-only", "origin/main", f"origin/{REMOVAL_BRANCH}").split()) == paths:
+            report.notice("removals", f"pull request #{existing['number']} already proposes these withdrawals")
+            return
+    git("checkout", "--quiet", "-B", REMOVAL_BRANCH, "origin/main")
+    try:
+        git("rm", "--quiet", *paths)
+        git("commit", "--quiet", "-m", title)
+        git("push", "--quiet", "--force", "origin", f"{REMOVAL_BRANCH}:{REMOVAL_BRANCH}")
+    finally:
+        git("checkout", "--quiet", "--detach", "origin/main")
+    if existing:
+        github.update_pull(repository, existing["number"], title, body)
+        report.notice("removals", f"updated pull request #{existing['number']}: {title}")
+    else:
+        pull = github.create_pull(repository, REMOVAL_BRANCH, "main", title, body)
+        report.notice("removals", f"opened pull request #{pull.get('number')}: {title}")
+
+
 def cmd_updates(args) -> int:
-    from .updates import find_update
+    from .updates import find_gone, find_update
     report = Report()
     records = load_catalog(APPS, report)
     wanted = {t.upper() for t in args.titleids}
     github = GitHub()
     found = []
+    gone = []
     for record in records:
         if wanted and record.titleid not in wanted:
             continue
         name = f"apps/{record.path.name}"
+        try:
+            lost = find_gone(record, github)
+        except GitHubError as error:
+            report.warning(name, f"could not check the source: {error}")
+            continue
+        if lost:
+            gone.append((record, lost))
+            report.warning(name, f"can no longer be installed: {lost}")
+            continue
         try:
             update, reason = find_update(record, github)
         except GitHubError as error:
@@ -351,6 +675,14 @@ def cmd_updates(args) -> int:
             open_updates_pr(found, repository, github, report)
         except (GitHubError, subprocess.CalledProcessError) as error:
             report.error("updates", f"could not open the pull request: {error}")
+        # Many apps gone at once looks like a fault on GitHub's side, not like withdrawals.
+        if len(gone) > max(3, len(records) // 4):
+            report.error("removals", f"{len(gone)} apps look gone at once; no pull request was opened")
+        elif not wanted:
+            try:
+                open_removals_pr(gone, repository, github, report)
+            except (GitHubError, subprocess.CalledProcessError) as error:
+                report.error("removals", f"could not open the pull request: {error}")
     return report.emit("Update check", f"{len(found)} update(s) found.")
 
 
@@ -383,12 +715,58 @@ def open_listing_pr(candidate, repository: str, github: GitHub, open_files: dict
     return f"#{pull.get('number')} opened"
 
 
+def cmd_comments(args) -> int:
+    """Keep one discussion per listed app, and write the likes and comments that clients read."""
+    from . import comments
+    report = Report()
+    records = load_catalog(APPS, report)
+    if report.failed:
+        return report.emit("Comments", "")
+    owner, _, name = (args.repository or os.environ.get("GITHUB_REPOSITORY", "")).partition("/")
+    github = GitHub()
+    try:
+        found = comments.setup(github, owner, name)
+        if found is None or comments.ACTIVE not in found[1]:
+            report.notice("comments", f"Discussions with a category \"{comments.ACTIVE}\" are not set up in "
+                                      f"{owner}/{name}; nothing to do")
+            return report.emit("Comments", "Nothing was changed.")
+        repository, categories = found
+        scope = comments.read_scope(os.environ.get("COMMENTS_SCOPE", ""))
+        threads = comments.read_threads(comments.list_nodes(github, owner, name), scope)
+        actions = comments.plan(records, threads)
+        for action in actions:
+            report.notice("comments", ("" if args.sync else "would ") + comments.describe(action))
+        if args.sync and actions:
+            try:
+                comments.apply(actions, github, repository, categories)
+            except GitHubError as error:
+                # GitHub stops a long row of new discussions part-way. What exists is published,
+                # and the next run goes on from there.
+                report.warning("comments", f"stopped part-way, the next run continues: {error}")
+            threads = comments.read_threads(comments.list_nodes(github, owner, name), scope)
+    except GitHubError as error:
+        # Nothing is written: the files that are published stay as they are.
+        report.error("comments", str(error))
+        return report.emit("Comments", "")
+    files = comments.payload(records, threads)
+    if args.out:
+        out = Path(args.out)
+        shutil.rmtree(out, ignore_errors=True)
+        for path, content in files.items():
+            target = out / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(json.dumps(content, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n",
+                              encoding="utf-8", newline="\n")
+    return report.emit("Comments", f"{len(files) - 1} app(s) have a discussion; {len(actions)} change(s).")
+
+
 def cmd_discover(args) -> int:
-    from .discover import MAX_NEW_PULLS, discover, publish, read_ignore, render
+    from .discover import MAX_NEW_PULLS, discover, publish, read_ignore, read_scope, render
     repository = os.environ.get("GITHUB_REPOSITORY", "")
     github = GitHub()
     result = discover(github, APPS, read_ignore(ROOT / "discovery" / "ignore.txt"), own_repo=repository,
-                      max_repos=args.max_repos)
+                      max_repos=args.max_repos,
+                      out_of_scope=read_scope(os.environ.get("DISCOVERY_SCOPE", "")))
     ready = sorted((c for c in result.candidates if c.status == "ready"), key=lambda c: c.repo.casefold())
     if args.open_prs:
         open_files = github.open_pull_files(repository)
@@ -438,7 +816,8 @@ def cmd_build(args) -> int:
     count = build_site(Path(args.out), APPS, report, base=args.base, site_url=args.site_url,
                        fetch_icons=not args.no_icons, theme=args.theme,
                        icon_cache=Path(args.icon_cache) if args.icon_cache else None,
-                       github=None if args.no_icons else GitHub())
+                       github=None if args.no_icons else GitHub(),
+                       scans=Path(args.scans) if args.scans else None, pages_url=args.pages_url)
     return report.emit("Site build", f"Built {count} app page(s) into {args.out}.")
 
 
@@ -516,6 +895,8 @@ def main(argv: list[str] | None = None) -> int:
     build.add_argument("--theme", default=DEFAULT_THEME, choices=sorted(THEMES))
     build.add_argument("--no-icons", action="store_true", help="offline build: no icons (placeholders) and no release facts in the API")
     build.add_argument("--icon-cache", help="directory that keeps fetched icons and release facts between builds")
+    build.add_argument("--pages-url", help="for a mirror of the API: the website whose app pages the API's `page` links name")
+    build.add_argument("--scans", help="directory of release scan summaries (catalog scan-all --out), for the safety labels")
     build.set_defaults(func=cmd_build)
 
     sign = commands.add_parser("sign", help="CI: sign the built API's manifest with CATALOG_SIGNING_KEY")
@@ -536,6 +917,12 @@ def main(argv: list[str] | None = None) -> int:
     updates.add_argument("--open-prs", action="store_true", help="CI: open or refresh one pull request per update")
     updates.set_defaults(func=cmd_updates)
 
+    comments = commands.add_parser("comments", help="one discussion per listed app; likes and comments as JSON")
+    comments.add_argument("--repository", default="", help="owner/name (default: GITHUB_REPOSITORY)")
+    comments.add_argument("--sync", action="store_true", help="CI: create, rename, lock and unlock discussions")
+    comments.add_argument("--out", default="", help="directory to write v1/index.json and v1/apps/*.json to")
+    comments.set_defaults(func=cmd_comments)
+
     discover = commands.add_parser("discover", help="find native PS5 apps on GitHub that aren't listed yet")
     discover.add_argument("--max-repos", type=int, default=600, help="release lookups per run")
     discover.add_argument("--open-prs", action="store_true", help="CI: open a listing pull request per ready app")
@@ -545,10 +932,29 @@ def main(argv: list[str] | None = None) -> int:
     pr = commands.add_parser("pr", help="CI: validate the pull request in GITHUB_EVENT_PATH")
     pr.set_defaults(func=cmd_pr)
 
+    scan = commands.add_parser("scan", help="download and statically scan release archives (needs requirements-scan.txt)")
+    scan.add_argument("titleids", nargs="*", help="title IDs to scan (default: every listed app)")
+    scan.add_argument("--zip", help="scan this ZIP file instead of downloading; give its title ID")
+    scan.add_argument("--helpers", action="store_true",
+                      help="print helpers/approved.json entries for the payloads that aren't on the list")
+    scan.set_defaults(func=cmd_scan)
+
+    scan_all = commands.add_parser("scan-all", help="CI: write a scan summary per listed release, scanning only new files")
+    scan_all.add_argument("--cache", required=True, help="directory that keeps summaries between runs")
+    scan_all.add_argument("--out", required=True, help="directory for the summaries of the listed releases")
+    scan_all.set_defaults(func=cmd_scan_all)
+
+    scan_pr = commands.add_parser("scan-pr", help="CI: scan the releases listed by the pull request in GITHUB_EVENT_PATH")
+    scan_pr.set_defaults(func=cmd_scan_pr)
+
     push = commands.add_parser("push", help="CI: validate records changed by a push")
     push.add_argument("--before", default="")
     push.add_argument("--after", default="HEAD")
     push.set_defaults(func=cmd_push)
+
+    automerge = commands.add_parser("automerge", help="CI: merge a developer's release bump of their own app")
+    automerge.add_argument("--merge", action="store_true", help="merge it (needs MERGE_TOKEN); otherwise only decide")
+    automerge.set_defaults(func=cmd_automerge)
 
     health = commands.add_parser("health", help="CI: re-verify listed releases (daily slice or all)")
     health.add_argument("--slice", default="all", choices=["all", "today"] + [str(n) for n in range(HEALTH_SLICES)],

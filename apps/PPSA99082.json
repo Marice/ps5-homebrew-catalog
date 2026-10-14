@@ -1,0 +1,13 @@
+{
+  "titleid": "PPSA99082",
+  "name": "OpenNOW PS5 - Prototype",
+  "kind": "app",
+  "description": "Experimental native PS5 GeForce NOW client: a working, console-tested prototype with hardware decoding and GPU presentation.",
+  "license": "GPL-3.0",
+  "author": "Portablelle",
+  "version": "0.1",
+  "source_repo": "https://github.com/Portablelle/OpenNOW-PS5",
+  "artifact_url": "https://github.com/Portablelle/OpenNOW-PS5/releases/download/0.1/OpenNOW-PS5-0.1.zip",
+  "sha256": "34c773dedda97d1503144eee50f9234ff1b4170a6ff68ed0bb0f59dd2ba87309",
+  "icon_url": "https://raw.githubusercontent.com/Portablelle/OpenNOW-PS5/0.1/sce_sys/icon0.png"
+}
