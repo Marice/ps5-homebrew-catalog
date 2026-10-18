@@ -3,7 +3,7 @@
   "name": "Signal Companion",
   "kind": "app",
   "category": "utilities",
-  "description": "Set the colour of your PS5's light and edit the startup beep tune and light show of the ps5-signal payload, which the app can start itself or add to ps5-autoloader.",
+  "description": "Set your PS5's light colour and ps5-signal's startup tune, and manage the suite: start, update and autoload ps5-signal, ps5-exporter and ps5-homeassistant, and link the PS5 to Home Assistant.",
   "license": "GPL-3.0-or-later",
   "author": "Marice",
   "version": "00.002.000",
