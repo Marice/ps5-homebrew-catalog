@@ -2,7 +2,7 @@
   "titleid": "PPSA67670",
   "name": "PayLoader",
   "kind": "app",
-  "category": "utilities",
+  "category": "tools",
   "description": "A controller front-end for Payload Manager (pldmgr), which it brings: start, install and update payloads, edit your boot chain with a USB safety net, and install the Signal suite.",
   "license": "GPL-3.0-or-later",
   "author": "Marice",
