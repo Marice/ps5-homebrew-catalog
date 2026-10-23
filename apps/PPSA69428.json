@@ -2,7 +2,7 @@
   "titleid": "PPSA69428",
   "name": "A2 Racer II",
   "kind": "game",
-  "category": "console-ports",
+  "category": "pc-ports",
   "description": "Native PS5 port of A2 Racer II (Davilex, 1998) on berobloom's a2racer2-re, with DualSense, touchpad mouse and a police light bar; needs your own disc image.",
   "license": "GPL-3.0-or-later",
   "author": "Marice",
